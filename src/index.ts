@@ -156,6 +156,34 @@ app.post('/api/verify-otp', async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Verify Failed" }); }
 });
 
+app.post('/api/google-login', async (req, res) => {
+  const { email, name, uid } = req.body;
+  try {
+    // ตรวจว่าเป็น admin ไหม
+    const adminResult = await db.execute({ sql: "SELECT * FROM admins WHERE email = ?", args: [email] });
+    if (adminResult.rows.length > 0) {
+      return res.json({ message: "แอดมินเข้าสู่ระบบสำเร็จ", user: { ...(adminResult.rows[0] as any), role: 'admin' } });
+    }
+
+    // ตรวจว่ามี user อยู่แล้วไหม
+    const userResult = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [email] });
+    if (userResult.rows.length > 0) {
+      const user = userResult.rows[0] as any;
+      return res.json({ message: "เข้าสู่ระบบสำเร็จ", user: { ...user, role: 'user' } });
+    }
+
+    // สร้าง user ใหม่อัตโนมัติ (Google verified แล้ว ไม่ต้อง OTP)
+    await db.execute({
+      sql: "INSERT INTO users (name, email, password, is_verified, pdpa_accepted) VALUES (?, ?, ?, 1, 1)",
+      args: [name || email, email, uid]
+    });
+    const newUser = await db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [email] });
+    return res.json({ message: "สร้างบัญชีและเข้าสู่ระบบสำเร็จ", user: { ...(newUser.rows[0] as any), role: 'user' } });
+  } catch (error) {
+    res.status(500).json({ error: "Google Login Failed" });
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   try {
