@@ -11,7 +11,7 @@ import { createHash } from 'crypto';
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
 const DB_URL       = process.env.TURSO_DB_URL!;
-const DB_TOKEN     = process.env.TURSO_DB_TOKEN!.trim();
+const DB_TOKEN     = process.env.TURSO_DB_TOKEN!.replace(/\s/g, '');
 const EMAIL_USER   = process.env.EMAIL_USER!;
 const EMAIL_PASS   = process.env.EMAIL_PASS!;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change_me';
