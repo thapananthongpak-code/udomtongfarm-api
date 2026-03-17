@@ -1,6 +1,9 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+import { setDefaultResultOrder } from 'dns';
+setDefaultResultOrder('ipv4first');
+
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
@@ -32,7 +35,6 @@ const transporter = nodemailer.createTransport({
   port: 587,
   secure: false,
   tls: { rejectUnauthorized: false },
-  socketOptions: { family: 4 },
   auth: { user: EMAIL_USER, pass: EMAIL_PASS },
 } as any);
 
