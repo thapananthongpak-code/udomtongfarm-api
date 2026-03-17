@@ -8,15 +8,19 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
-import nodemailer from 'nodemailer';
+import sgMail from '@sendgrid/mail';
 import { createHash } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
 const DB_URL       = process.env.TURSO_DB_URL!;
 const DB_TOKEN     = process.env.TURSO_DB_TOKEN!.replace(/\s/g, '');
-const EMAIL_USER   = process.env.EMAIL_USER!;
-const EMAIL_PASS   = process.env.EMAIL_PASS!;
+const EMAIL_USER      = process.env.EMAIL_USER!;
+const EMAIL_PASS      = process.env.EMAIL_PASS!;
+const SENDGRID_KEY    = process.env.SENDGRID_API_KEY || '';
+const SENDGRID_FROM   = process.env.SENDGRID_FROM_EMAIL || EMAIL_USER;
+
+if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change_me';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
   .split(',').map((o) => o.trim());
@@ -30,13 +34,16 @@ if (!DB_URL || !DB_TOKEN) {
 const db = createClient({ url: DB_URL, authToken: DB_TOKEN });
 
 // ─── Email ────────────────────────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  tls: { rejectUnauthorized: false },
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-} as any);
+async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
+  if (!SENDGRID_KEY) { console.warn('[Email] No SENDGRID_API_KEY set'); return false; }
+  try {
+    await sgMail.send({ to, from: SENDGRID_FROM, subject, html });
+    return true;
+  } catch (err: any) {
+    console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
+    return false;
+  }
+}
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
@@ -293,18 +300,11 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 
     if (process.env.NODE_ENV !== 'production') console.log(`\n[OTP] ${email} => ${otpCode}\n`);
 
-    if (EMAIL_USER && EMAIL_PASS) {
-      try {
-        await transporter.sendMail({
-          from: `"Udomtong Farm" <${EMAIL_USER}>`,
-          to: email,
-          subject: 'รหัส OTP สมัครสมาชิก Udomtong Farm',
-          html: `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">ยินดีต้อนรับสู่ Udomtong Farm</h2><p>รหัส OTP สำหรับยืนยันอีเมลของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
-        });
-      } catch (mailErr) {
-        console.error('[Email error] sendMail failed:', mailErr);
-      }
-    }
+    await sendEmail(
+      email,
+      'รหัส OTP สมัครสมาชิก Udomtong Farm',
+      `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">ยินดีต้อนรับสู่ Udomtong Farm</h2><p>รหัส OTP สำหรับยืนยันอีเมลของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
+    );
 
     res.json({ message: 'สมัครสมาชิกสำเร็จ! กรุณายืนยัน OTP ทางอีเมล' });
   } catch (e) {
@@ -485,20 +485,11 @@ app.post('/api/forgot-password', authLimiter, async (req: Request, res: Response
 
     if (process.env.NODE_ENV !== 'production') console.log(`\n[OTP-RESET] ${email} => ${otpCode}\n`);
 
-    let emailSent = false;
-    if (EMAIL_USER && EMAIL_PASS) {
-      try {
-        await transporter.sendMail({
-          from: `"Udomtong Farm" <${EMAIL_USER}>`,
-          to: email,
-          subject: 'รหัส OTP รีเซ็ตรหัสผ่าน Udomtong Farm',
-          html: `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">รีเซ็ตรหัสผ่าน</h2><p>รหัส OTP ของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
-        });
-        emailSent = true;
-      } catch (mailErr) {
-        console.error('[Email error] sendMail failed:', mailErr);
-      }
-    }
+    const emailSent = await sendEmail(
+      email,
+      'รหัส OTP รีเซ็ตรหัสผ่าน Udomtong Farm',
+      `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">รีเซ็ตรหัสผ่าน</h2><p>รหัส OTP ของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
+    );
 
     res.json({ message: 'ส่ง OTP แล้ว', emailSent });
   } catch (e) {
