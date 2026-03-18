@@ -9,7 +9,7 @@ import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
 import sgMail from '@sendgrid/mail';
-import { createHash } from 'crypto';
+import { createHash, createHmac } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
@@ -22,6 +22,29 @@ const SENDGRID_FROM   = process.env.SENDGRID_FROM_EMAIL || EMAIL_USER;
 
 if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change_me';
+const JWT_SECRET   = process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025';
+
+// ─── JWT helpers ──────────────────────────────────────────────────────────────
+function b64url(str: string) {
+  return Buffer.from(str).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function makeJwt(payload: object): string {
+  const hdr = b64url(JSON.stringify({ alg:'HS256', typ:'JWT' }));
+  const bdy = b64url(JSON.stringify({ ...payload, iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000) + 60*60*24*30 }));
+  const sig = createHmac('sha256', JWT_SECRET).update(`${hdr}.${bdy}`).digest('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+  return `${hdr}.${bdy}.${sig}`;
+}
+function verifyJwt(token: string): { email?: string; role?: string } | null {
+  try {
+    const [hdr, bdy, sig] = token.split('.');
+    if (!hdr || !bdy || !sig) return null;
+    const expected = createHmac('sha256', JWT_SECRET).update(`${hdr}.${bdy}`).digest('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+    if (sig !== expected) return null;
+    const payload = JSON.parse(Buffer.from(bdy, 'base64').toString());
+    if (payload.exp && payload.exp < Math.floor(Date.now()/1000)) return null;
+    return payload;
+  } catch { return null; }
+}
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
   .split(',').map((o) => o.trim());
 
@@ -111,14 +134,17 @@ function hashPassword(plain: string): string {
 }
 
 // ─── Admin auth helper ────────────────────────────────────────────────────────
+function getLang(req: Request): 'th' | 'en' {
+  return (req.headers['x-lang'] === 'th') ? 'th' : 'en';
+}
 async function requireAdmin(req: Request, res: Response): Promise<boolean> {
+  const lang  = getLang(req);
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) { res.status(401).json({ error: 'Unauthorized' }); return false; }
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') { res.status(403).json({ error: 'Forbidden' }); return false; }
-    return true;
-  } catch { res.status(401).json({ error: 'Invalid token' }); return false; }
+  if (!token) { res.status(401).json({ error: lang === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' }); return false; }
+  const payload = verifyJwt(token);
+  if (!payload) { res.status(401).json({ error: lang === 'th' ? 'Token ไม่ถูกต้องหรือหมดอายุ' : 'Invalid or expired token' }); return false; }
+  if (payload.role !== 'admin') { res.status(403).json({ error: lang === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' }); return false; }
+  return true;
 }
 
 // ─── Setup route guard ────────────────────────────────────────────────────────
@@ -287,7 +313,7 @@ app.delete('/api/species/:id', async (req: Request, res: Response) => {
 // REGISTER
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
-  const { email, password, name, nickname, phone, birthDate, pdpa, avatar } = req.body;
+  const { email, password, name, nickname, phone, birthDate, pdpa, avatar, addressLine, district, province, postalCode } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -332,7 +358,7 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 // VERIFY OTP
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/verify-otp', authLimiter, async (req: Request, res: Response) => {
-  const { email, otpCode } = req.body;
+  const { email, otpCode, addressLine, district, province, postalCode, name, phone } = req.body;
   if (!email || !otpCode) return res.status(400).json({ error: 'Missing fields' });
   try {
     const result = await db.execute({
@@ -342,6 +368,15 @@ app.post('/api/verify-otp', authLimiter, async (req: Request, res: Response) => 
     if ((result.rows as any[]).length === 0) return res.status(400).json({ error: 'OTP ไม่ถูกต้องหรือหมดอายุ' });
     await db.execute({ sql: 'UPDATE users SET is_verified = 1 WHERE email = ?', args: [email] });
     await db.execute({ sql: 'DELETE FROM otps WHERE email = ?', args: [email] });
+    // บันทึกที่อยู่ถ้ามีข้อมูลส่งมาด้วย
+    if (addressLine && province) {
+      try {
+        await db.execute({
+          sql: `INSERT INTO user_addresses (user_email, name, phone, address_line, district, province, postal_code, is_default) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+          args: [email, sanitizeStr(name) || email, sanitizeStr(phone) || '', sanitizeStr(addressLine), sanitizeStr(district) || '', sanitizeStr(province), sanitizeStr(postalCode) || ''],
+        });
+      } catch (e) { console.warn('Address save skipped:', e); }
+    }
     res.json({ message: 'ยืนยันอีเมลสำเร็จ!' });
   } catch { res.status(500).json({ error: 'Verify failed' }); }
 });
@@ -363,7 +398,8 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
         return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง', field: 'password' });
       }
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', user: { ...admin, role: 'admin' } });
+      const adminToken = makeJwt({ email: admin.email, role: 'admin' });
+      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: adminToken, user: { ...admin, role: 'admin', token: adminToken } });
     }
 
     const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
@@ -374,7 +410,8 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
       }
       if (user.is_verified === 0) return res.status(403).json({ error: 'อีเมลนี้ยังไม่ได้รับการยืนยัน กรุณาตรวจสอบกล่องจดหมาย', field: 'email' });
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', user: { ...user, role: 'user' } });
+      const userToken = makeJwt({ email: user.email, role: 'user' });
+      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', token: userToken, user: { ...user, role: 'user', token: userToken } });
     }
 
     res.status(401).json({ error: 'ไม่พบอีเมลนี้ในระบบ', field: 'email' });
@@ -393,7 +430,8 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
     if ((adminResult.rows as any[]).length > 0) {
       const admin = adminResult.rows[0] as any;
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', user: { ...admin, role: 'admin', avatar: photoURL || admin.avatar || null } });
+      const gAdminToken = makeJwt({ email: admin.email, role: 'admin' });
+      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: gAdminToken, user: { ...admin, role: 'admin', avatar: photoURL || admin.avatar || null, token: gAdminToken } });
     }
     const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
     if ((userResult.rows as any[]).length > 0) {
@@ -401,7 +439,8 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
       // อัปเดต avatar ถ้า Google ส่งมา
       try { if (photoURL && photoURL !== user.avatar) { await db.execute({ sql: 'UPDATE users SET avatar = ? WHERE email = ?', args: [photoURL, email] }); } } catch {}
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', user: { ...user, role: 'user', avatar: photoURL || user.avatar || null } });
+      const gUserToken = makeJwt({ email: user.email, role: 'user' });
+      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', token: gUserToken, user: { ...user, role: 'user', avatar: photoURL || user.avatar || null, token: gUserToken } });
     }
     await db.execute({
       sql: 'INSERT INTO users (name, email, password, is_verified, pdpa_accepted, avatar) VALUES (?, ?, ?, 1, 1, ?)',
@@ -410,7 +449,8 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
     const newUser = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
     const created = newUser.rows[0] as any;
     try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [created.email, created.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-    return res.json({ message: 'สร้างบัญชีและเข้าสู่ระบบสำเร็จ', user: { ...created, role: 'user' } });
+    const gNewToken = makeJwt({ email: created.email, role: 'user' });
+    return res.json({ message: 'สร้างบัญชีและเข้าสู่ระบบสำเร็จ', token: gNewToken, user: { ...created, role: 'user', token: gNewToken } });
   } catch (e) { console.error('Google login error:', e); res.status(500).json({ error: 'Google login failed' }); }
 });
 
@@ -466,11 +506,9 @@ app.post('/api/logout', async (req: Request, res: Response) => {
 app.get('/api/login-sessions', async (req: Request, res: Response) => {
   // simple token check — admin only
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!token) return res.status(401).json({ error: getLang(req) === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' });
+  const _payload = verifyJwt(token);
+  if (!_payload || _payload.role !== 'admin') return res.status(403).json({ error: getLang(req) === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' });
   try {
     const limit = Math.min(Number(req.query['limit']) || 100, 500);
     const result = await db.execute({
@@ -560,11 +598,8 @@ app.get('/api/users', async (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/api/users/:email', async (req: Request, res: Response) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!token) return res.status(401).json({ error: getLang(req) === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' });
+  { const p = verifyJwt(token); if (!p || p.role !== 'admin') return res.status(403).json({ error: getLang(req) === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' }); }
   const email = String(req.params.email);
   try {
     const result = await db.execute({ sql: 'SELECT id, name, nickname, email, phone, birth_date, is_verified, pdpa_accepted, avatar FROM users WHERE email = ?', args: [email] });
@@ -575,11 +610,8 @@ app.get('/api/users/:email', async (req: Request, res: Response) => {
 
 app.delete('/api/users/:email', async (req: Request, res: Response) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!token) return res.status(401).json({ error: getLang(req) === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' });
+  { const p = verifyJwt(token); if (!p || p.role !== 'admin') return res.status(403).json({ error: getLang(req) === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' }); }
 
   const targetEmail = String(req.params.email);
   if (!targetEmail || targetEmail === "undefined") return res.status(400).json({ error: 'Missing email' });
@@ -615,11 +647,8 @@ app.delete('/api/users/:email', async (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/api/deleted-users', async (req: Request, res: Response) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!token) return res.status(401).json({ error: getLang(req) === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' });
+  { const p = verifyJwt(token); if (!p || p.role !== 'admin') return res.status(403).json({ error: getLang(req) === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' }); }
 
   try {
     const result = await db.execute('SELECT * FROM deleted_users ORDER BY id DESC LIMIT 200');
@@ -662,11 +691,8 @@ app.get('/api/settings', async (_req: Request, res: Response) => {
 
 app.put('/api/settings', async (req: Request, res: Response) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
-    if (payload?.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!token) return res.status(401).json({ error: getLang(req) === 'th' ? 'ไม่ได้รับอนุญาต' : 'Unauthorized' });
+  { const p = verifyJwt(token); if (!p || p.role !== 'admin') return res.status(403).json({ error: getLang(req) === 'th' ? 'ไม่มีสิทธิ์เข้าถึง' : 'Forbidden' }); }
 
   const updates = req.body;
   if (typeof updates !== 'object' || updates === null || Array.isArray(updates)) {
