@@ -729,11 +729,11 @@ app.get('/api/products', async (_req: Request, res: Response) => {
 app.put('/api/products/:id', async (req: Request, res: Response) => {
   if (!await requireAdmin(req, res)) return;
   const id = req.params['id'] as string;
-  const { price, stock, unit, available } = req.body;
+  const { price, stock, unit, available, age, gender } = req.body;
   try {
     await db.execute({
-      sql: 'UPDATE species SET price = ?, stock = ?, unit = ?, available = ? WHERE id = ?',
-      args: [Number(price) || 0, Number(stock) || 0, unit ?? 'ตัว/ต้น', available ? 1 : 0, id],
+      sql: 'UPDATE species SET price = ?, stock = ?, unit = ?, available = ?, age = ?, gender = ? WHERE id = ?',
+      args: [Number(price) || 0, Number(stock) || 0, unit ?? 'ตัว/ต้น', available ? 1 : 0, age ?? null, gender ?? null, id],
     });
     res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
   } catch { res.status(500).json({ error: 'Update failed' }); }
@@ -742,14 +742,14 @@ app.put('/api/products/:id', async (req: Request, res: Response) => {
 // Batch update prices/stock (admin)
 app.put('/api/products', async (req: Request, res: Response) => {
   if (!await requireAdmin(req, res)) return;
-  const updates: Array<{ id: string; price?: number; stock?: number; unit?: string; available?: boolean }> = req.body;
+  const updates: Array<{ id: string; price?: number; stock?: number; unit?: string; available?: boolean; age?: string; gender?: string }> = req.body;
   if (!Array.isArray(updates)) return res.status(400).json({ error: 'Body must be an array' });
   try {
     for (const u of updates) {
       if (!u.id) continue;
       await db.execute({
-        sql: 'UPDATE species SET price = COALESCE(?, price), stock = COALESCE(?, stock), unit = COALESCE(?, unit), available = COALESCE(?, available) WHERE id = ?',
-        args: [u.price !== undefined ? Number(u.price) : null, u.stock !== undefined ? Number(u.stock) : null, u.unit ?? null, u.available !== undefined ? (u.available ? 1 : 0) : null, u.id],
+        sql: 'UPDATE species SET price = COALESCE(?, price), stock = COALESCE(?, stock), unit = COALESCE(?, unit), available = COALESCE(?, available), age = COALESCE(?, age), gender = COALESCE(?, gender) WHERE id = ?',
+        args: [u.price !== undefined ? Number(u.price) : null, u.stock !== undefined ? Number(u.stock) : null, u.unit ?? null, u.available !== undefined ? (u.available ? 1 : 0) : null, u.age ?? null, u.gender ?? null, u.id],
       });
     }
     res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
@@ -1057,6 +1057,8 @@ async function initDB() {
       `ALTER TABLE species ADD COLUMN stock INTEGER DEFAULT 0`,
       `ALTER TABLE species ADD COLUMN unit TEXT DEFAULT 'ตัว/ต้น'`,
       `ALTER TABLE species ADD COLUMN available INTEGER DEFAULT 1`,
+      `ALTER TABLE species ADD COLUMN age TEXT`,
+      `ALTER TABLE species ADD COLUMN gender TEXT`,
       // shipping columns for orders
       `ALTER TABLE orders ADD COLUMN shipping_company TEXT`,
       `ALTER TABLE orders ADD COLUMN tracking_number TEXT`,
