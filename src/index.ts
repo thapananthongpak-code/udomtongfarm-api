@@ -110,6 +110,17 @@ function hashPassword(plain: string): string {
   return createHash('sha256').update(plain + 'uf_salt_2025').digest('hex');
 }
 
+// ─── Admin auth helper ────────────────────────────────────────────────────────
+async function requireAdmin(req: Request, res: Response): Promise<boolean> {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) { res.status(401).json({ error: 'Unauthorized' }); return false; }
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64').toString());
+    if (payload?.role !== 'admin') { res.status(403).json({ error: 'Forbidden' }); return false; }
+    return true;
+  } catch { res.status(401).json({ error: 'Invalid token' }); return false; }
+}
+
 // ─── Setup route guard ────────────────────────────────────────────────────────
 function requireSecret(req: Request, res: Response, next: NextFunction) {
   if (req.query.secret !== ADMIN_SECRET) {
@@ -226,6 +237,10 @@ app.get('/api/species', async (_req: Request, res: Response) => {
       ...row,
       tags:       JSON.parse(row.tags || '[]'),
       references: JSON.parse(row.references_data || '[]'),
+      price:      row.price ?? 0,
+      stock:      row.stock ?? 0,
+      unit:       row.unit ?? 'ตัว/ต้น',
+      available:  row.available === undefined ? true : row.available === 1,
     })));
   } catch { res.status(500).json({ error: 'Failed to fetch species' }); }
 });
@@ -673,6 +688,245 @@ app.put('/api/settings', async (req: Request, res: Response) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRODUCTS — price / stock management (extends species)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/products', async (_req: Request, res: Response) => {
+  try {
+    const result = await db.execute(
+      'SELECT id, type, name_th, name_en, image, price, stock, unit, available FROM species ORDER BY name_th'
+    );
+    res.json(result.rows);
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+app.put('/api/products/:id', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  const id = req.params['id'] as string;
+  const { price, stock, unit, available } = req.body;
+  try {
+    await db.execute({
+      sql: 'UPDATE species SET price = ?, stock = ?, unit = ?, available = ? WHERE id = ?',
+      args: [Number(price) || 0, Number(stock) || 0, unit ?? 'ตัว/ต้น', available ? 1 : 0, id],
+    });
+    res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Update failed' }); }
+});
+
+// Batch update prices/stock (admin)
+app.put('/api/products', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  const updates: Array<{ id: string; price?: number; stock?: number; unit?: string; available?: boolean }> = req.body;
+  if (!Array.isArray(updates)) return res.status(400).json({ error: 'Body must be an array' });
+  try {
+    for (const u of updates) {
+      if (!u.id) continue;
+      await db.execute({
+        sql: 'UPDATE species SET price = COALESCE(?, price), stock = COALESCE(?, stock), unit = COALESCE(?, unit), available = COALESCE(?, available) WHERE id = ?',
+        args: [u.price !== undefined ? Number(u.price) : null, u.stock !== undefined ? Number(u.stock) : null, u.unit ?? null, u.available !== undefined ? (u.available ? 1 : 0) : null, u.id],
+      });
+    }
+    res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Batch update failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADDRESSES — user shipping addresses
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/addresses', async (req: Request, res: Response) => {
+  const email = req.query['email'] as string;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  try {
+    const result = await db.execute({
+      sql: 'SELECT * FROM user_addresses WHERE user_email = ? ORDER BY is_default DESC, id DESC',
+      args: [email],
+    });
+    res.json(result.rows);
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+app.post('/api/addresses', async (req: Request, res: Response) => {
+  const { user_email, name, phone, address_line, district, province, postal_code, is_default } = req.body;
+  if (!user_email || !name || !address_line || !province) {
+    return res.status(400).json({ error: 'Missing required fields (name, address_line, province)' });
+  }
+  try {
+    if (is_default) {
+      await db.execute({ sql: 'UPDATE user_addresses SET is_default = 0 WHERE user_email = ?', args: [user_email] });
+    }
+    await db.execute({
+      sql: 'INSERT INTO user_addresses (user_email, name, phone, address_line, district, province, postal_code, is_default) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      args: [user_email, sanitizeStr(name), sanitizeStr(phone), sanitizeStr(address_line, 500), sanitizeStr(district), sanitizeStr(province), sanitizeStr(postal_code, 10), is_default ? 1 : 0],
+    });
+    res.json({ message: 'เพิ่มที่อยู่สำเร็จ' });
+  } catch { res.status(500).json({ error: 'Add address failed' }); }
+});
+
+app.put('/api/addresses/:id', async (req: Request, res: Response) => {
+  const id = req.params['id'] as string;
+  const { user_email, name, phone, address_line, district, province, postal_code, is_default } = req.body;
+  if (!user_email || !name || !address_line || !province) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  try {
+    if (is_default) {
+      await db.execute({ sql: 'UPDATE user_addresses SET is_default = 0 WHERE user_email = ?', args: [user_email] });
+    }
+    await db.execute({
+      sql: 'UPDATE user_addresses SET name = ?, phone = ?, address_line = ?, district = ?, province = ?, postal_code = ?, is_default = ? WHERE id = ? AND user_email = ?',
+      args: [sanitizeStr(name), sanitizeStr(phone), sanitizeStr(address_line, 500), sanitizeStr(district), sanitizeStr(province), sanitizeStr(postal_code, 10), is_default ? 1 : 0, id, user_email],
+    });
+    res.json({ message: 'อัปเดตที่อยู่สำเร็จ' });
+  } catch { res.status(500).json({ error: 'Update failed' }); }
+});
+
+app.delete('/api/addresses/:id', async (req: Request, res: Response) => {
+  const id = req.params['id'] as string;
+  const user_email = req.body?.user_email || req.query['email'];
+  if (!user_email) return res.status(400).json({ error: 'Missing user_email' });
+  try {
+    await db.execute({ sql: 'DELETE FROM user_addresses WHERE id = ? AND user_email = ?', args: [id, user_email] });
+    res.json({ message: 'ลบที่อยู่สำเร็จ' });
+  } catch { res.status(500).json({ error: 'Delete failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDERS — create, view (user + admin)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/orders', async (req: Request, res: Response) => {
+  const { user_email, items, total_amount, payment_method, shipping_address, shipping_company, note } = req.body;
+  if (!user_email || !items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  try {
+    await db.execute({
+      sql: `INSERT INTO orders (id, user_email, total_amount, status, payment_method, shipping_address, shipping_company, note) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
+      args: [orderId, user_email, Number(total_amount) || 0, sanitizeStr(payment_method || 'promptpay', 50), JSON.stringify(shipping_address || {}), sanitizeStr(shipping_company || '', 50), sanitizeStr(note || '', 500)],
+    });
+    for (const item of items) {
+      await db.execute({
+        sql: 'INSERT INTO order_items (order_id, species_id, species_name, species_image, species_type, quantity, unit_price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [orderId, sanitizeStr(item.species_id), sanitizeStr(item.species_name || ''), sanitizeStr(item.species_image || '', 2000), sanitizeStr(item.species_type || ''), Number(item.quantity) || 1, Number(item.unit_price) || 0, Number(item.subtotal) || 0],
+      });
+      // Reduce stock (non-blocking)
+      try {
+        await db.execute({ sql: 'UPDATE species SET stock = MAX(0, stock - ?) WHERE id = ?', args: [Number(item.quantity) || 1, item.species_id] });
+      } catch {}
+    }
+    res.json({ message: 'สั่งซื้อสำเร็จ!', orderId });
+  } catch (e) {
+    console.error('Create order error:', e);
+    res.status(500).json({ error: 'สร้างคำสั่งซื้อล้มเหลว' });
+  }
+});
+
+// User: get my orders
+app.get('/api/orders/my', async (req: Request, res: Response) => {
+  const email = req.query['email'] as string;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  try {
+    const orders = await db.execute({ sql: 'SELECT * FROM orders WHERE user_email = ? ORDER BY created_at DESC LIMIT 100', args: [email] });
+    const result = [];
+    for (const order of orders.rows as any[]) {
+      const items = await db.execute({ sql: 'SELECT * FROM order_items WHERE order_id = ?', args: [order['id']] });
+      result.push({ ...order, shipping_address: (() => { try { return JSON.parse(order['shipping_address'] || '{}'); } catch { return {}; } })(), items: items.rows });
+    }
+    res.json(result);
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+// Single order detail
+app.get('/api/orders/:id', async (req: Request, res: Response) => {
+  const id = req.params['id'] as string;
+  try {
+    const orders = await db.execute({ sql: 'SELECT * FROM orders WHERE id = ?', args: [id] });
+    if ((orders.rows as any[]).length === 0) return res.status(404).json({ error: 'ไม่พบคำสั่งซื้อ' });
+    const order = orders.rows[0] as any;
+    const items = await db.execute({ sql: 'SELECT * FROM order_items WHERE order_id = ?', args: [id] });
+    res.json({ ...order, shipping_address: (() => { try { return JSON.parse(order['shipping_address'] || '{}'); } catch { return {}; } })(), items: items.rows });
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+// Admin: all orders
+app.get('/api/admin/orders', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const limit = Math.min(Number(req.query['limit']) || 200, 1000);
+    const status = req.query['status'] as string | undefined;
+    let sql = 'SELECT * FROM orders';
+    const args: any[] = [];
+    if (status) { sql += ' WHERE status = ?'; args.push(status); }
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    args.push(limit);
+    const orders = await db.execute({ sql, args });
+    res.json((orders.rows as any[]).map(o => ({ ...o, shipping_address: (() => { try { return JSON.parse(o['shipping_address'] || '{}'); } catch { return {}; } })() })));
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+// Admin: order detail with items
+app.get('/api/admin/orders/:id', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  const id = req.params['id'] as string;
+  try {
+    const orders = await db.execute({ sql: 'SELECT * FROM orders WHERE id = ?', args: [id] });
+    if ((orders.rows as any[]).length === 0) return res.status(404).json({ error: 'ไม่พบคำสั่งซื้อ' });
+    const order = orders.rows[0] as any;
+    const items = await db.execute({ sql: 'SELECT * FROM order_items WHERE order_id = ?', args: [id] });
+    res.json({ ...order, shipping_address: (() => { try { return JSON.parse(order['shipping_address'] || '{}'); } catch { return {}; } })(), items: items.rows });
+  } catch { res.status(500).json({ error: 'Fetch failed' }); }
+});
+
+// Admin: update order status + shipping info
+app.put('/api/admin/orders/:id/status', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  const id = req.params['id'] as string;
+  const { status, shipping_company, tracking_number, estimated_delivery } = req.body;
+  const valid = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'];
+  if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  try {
+    await db.execute({
+      sql: `UPDATE orders SET status = ?, shipping_company = COALESCE(?, shipping_company), tracking_number = COALESCE(?, tracking_number), estimated_delivery = COALESCE(?, estimated_delivery), updated_at = DATETIME('now') WHERE id = ?`,
+      args: [status, shipping_company || null, tracking_number || null, estimated_delivery || null, id],
+    });
+    res.json({ message: 'อัปเดตสถานะสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Update failed' }); }
+});
+
+// Admin: update shipping info only (tracking, company, estimated delivery)
+app.put('/api/admin/orders/:id/shipping', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  const id = req.params['id'] as string;
+  const { shipping_company, tracking_number, estimated_delivery } = req.body;
+  try {
+    await db.execute({
+      sql: `UPDATE orders SET shipping_company = COALESCE(?, shipping_company), tracking_number = COALESCE(?, tracking_number), estimated_delivery = COALESCE(?, estimated_delivery), updated_at = DATETIME('now') WHERE id = ?`,
+      args: [shipping_company || null, tracking_number || null, estimated_delivery || null, id],
+    });
+    res.json({ message: 'อัปเดตข้อมูลการจัดส่งสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Update failed' }); }
+});
+
+// Polling: get updated orders since timestamp
+app.get('/api/orders/poll', async (req: Request, res: Response) => {
+  const email = req.query['email'] as string;
+  const since = req.query['since'] as string;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  try {
+    const sql = since
+      ? 'SELECT * FROM orders WHERE user_email = ? AND updated_at > ? ORDER BY created_at DESC LIMIT 50'
+      : 'SELECT * FROM orders WHERE user_email = ? ORDER BY created_at DESC LIMIT 50';
+    const args = since ? [email, since] : [email];
+    const orders = await db.execute({ sql, args });
+    const result = [];
+    for (const order of orders.rows as any[]) {
+      const items = await db.execute({ sql: 'SELECT * FROM order_items WHERE order_id = ?', args: [order['id']] });
+      result.push({ ...order, shipping_address: (() => { try { return JSON.parse(order['shipping_address'] || '{}'); } catch { return {}; } })(), items: items.rows });
+    }
+    res.json(result);
+  } catch { res.status(500).json({ error: 'Poll failed' }); }
+});
+
 // ─── Global error handler ────────────────────────────────────────────────────
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('Unhandled error:', err.message);
@@ -731,6 +985,40 @@ async function initDB() {
       key TEXT PRIMARY KEY,
       value TEXT
     )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS user_addresses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_email TEXT NOT NULL,
+      name TEXT NOT NULL,
+      phone TEXT,
+      address_line TEXT NOT NULL,
+      district TEXT,
+      province TEXT NOT NULL,
+      postal_code TEXT,
+      is_default INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      total_amount REAL NOT NULL DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      payment_method TEXT DEFAULT 'promptpay',
+      shipping_address TEXT,
+      note TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS order_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL,
+      species_id TEXT NOT NULL,
+      species_name TEXT,
+      species_image TEXT,
+      species_type TEXT,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      unit_price REAL NOT NULL DEFAULT 0,
+      subtotal REAL NOT NULL DEFAULT 0
+    )`);
     // migrate: add columns if missing
     const migrations = [
       `ALTER TABLE users ADD COLUMN nickname TEXT`,
@@ -738,6 +1026,15 @@ async function initDB() {
       `ALTER TABLE users ADD COLUMN birth_date TEXT`,
       `ALTER TABLE users ADD COLUMN avatar TEXT`,
       `ALTER TABLE users ADD COLUMN pdpa_accepted BOOLEAN DEFAULT 0`,
+      // shop columns for species
+      `ALTER TABLE species ADD COLUMN price REAL DEFAULT 0`,
+      `ALTER TABLE species ADD COLUMN stock INTEGER DEFAULT 0`,
+      `ALTER TABLE species ADD COLUMN unit TEXT DEFAULT 'ตัว/ต้น'`,
+      `ALTER TABLE species ADD COLUMN available INTEGER DEFAULT 1`,
+      // shipping columns for orders
+      `ALTER TABLE orders ADD COLUMN shipping_company TEXT`,
+      `ALTER TABLE orders ADD COLUMN tracking_number TEXT`,
+      `ALTER TABLE orders ADD COLUMN estimated_delivery TEXT`,
     ];
     for (const sql of migrations) {
       try { await db.execute(sql); } catch {}
