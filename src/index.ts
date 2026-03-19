@@ -397,9 +397,15 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
       if (admin.password !== hashedPw && admin.password !== password) {
         return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง', field: 'password' });
       }
-      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-      const adminToken = makeJwt({ email: admin.email, role: 'admin' });
-      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: adminToken, user: { ...admin, role: 'admin', token: adminToken } });
+      // Admin 2FA: send OTP before granting JWT
+      const adminOtp = Math.floor(100000 + Math.random() * 900000).toString();
+      const adminOtpExp = new Date(Date.now() + 15 * 60000).toISOString();
+      await db.execute({ sql: 'DELETE FROM otps WHERE email = ?', args: [admin.email] });
+      await db.execute({ sql: 'INSERT INTO otps (email, otp_code, expires_at) VALUES (?, ?, ?)', args: [admin.email, adminOtp, adminOtpExp] });
+      if (process.env.NODE_ENV !== 'production') console.log(`\n[ADMIN-2FA] ${admin.email} => ${adminOtp}\n`);
+      const admin2faHtml = `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f8fafc;border-radius:12px"><h2 style="color:#1d4ed8;margin:0 0 8px">🔐 Admin Login - 2FA Code</h2><p style="color:#374151;margin:0 0 24px">กรุณาใส่รหัส OTP ด้านล่างเพื่อเข้าสู่ระบบ Admin</p><div style="background:#fff;border:2px solid #3b82f6;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1d4ed8;letter-spacing:0.2em">${adminOtp}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">หมดอายุใน 15 นาที</div></div><p style="color:#6b7280;font-size:0.8rem;margin:0">หากไม่ใช่คุณที่กำลังล็อกอิน กรุณาเปลี่ยนรหัสผ่านทันที</p></div>`;
+      await sendEmail(admin.email, 'Udomtong Farm Admin 2FA Code', admin2faHtml);
+      return res.json({ needs_2fa: true, email: admin.email, message: 'ส่งรหัส OTP ไปยังอีเมลแอดมินแล้ว' });
     }
 
     const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
@@ -933,6 +939,147 @@ app.put('/api/admin/orders/:id/shipping', async (req: Request, res: Response) =>
   } catch { res.status(500).json({ error: 'Update failed' }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN 2FA VERIFY
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/verify-2fa', authLimiter, async (req: Request, res: Response) => {
+  const { email, otpCode } = req.body;
+  if (!email || !otpCode) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const result = await db.execute({
+      sql: `SELECT * FROM otps WHERE email = ? AND otp_code = ? AND expires_at > DATETIME('now') ORDER BY id DESC LIMIT 1`,
+      args: [email, String(otpCode)],
+    });
+    if ((result.rows as any[]).length === 0) return res.status(400).json({ error: 'OTP ไม่ถูกต้องหรือหมดอายุ' });
+    await db.execute({ sql: 'DELETE FROM otps WHERE email = ?', args: [email] });
+    const adminResult = await db.execute({ sql: 'SELECT * FROM admins WHERE email = ?', args: [email] });
+    if ((adminResult.rows as any[]).length === 0) return res.status(404).json({ error: 'ไม่พบแอดมิน' });
+    const admin = adminResult.rows[0] as any;
+    try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch {}
+    const adminToken = makeJwt({ email: admin.email, role: 'admin' });
+    return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: adminToken, user: { ...admin, role: 'admin', token: adminToken } });
+  } catch { res.status(500).json({ error: 'Verify 2FA failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REVIEWS API
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/reviews/:speciesId', async (req: Request, res: Response) => {
+  const speciesId = req.params['speciesId'] as string;
+  try {
+    const result = await db.execute({
+      sql: 'SELECT * FROM reviews WHERE species_id = ? ORDER BY created_at DESC LIMIT 100',
+      args: [speciesId],
+    });
+    res.json(result.rows);
+  } catch { res.status(500).json({ error: 'Fetch reviews failed' }); }
+});
+
+app.post('/api/reviews', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const payload = verifyJwt(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid token' });
+  const { species_id, rating, comment } = req.body;
+  if (!species_id || !rating) return res.status(400).json({ error: 'Missing required fields' });
+  if (Number(rating) < 1 || Number(rating) > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  try {
+    const existing = await db.execute({ sql: 'SELECT id FROM reviews WHERE species_id = ? AND user_email = ?', args: [species_id, payload.email] });
+    if ((existing.rows as any[]).length > 0) {
+      await db.execute({ sql: `UPDATE reviews SET rating = ?, comment = ?, created_at = DATETIME('now') WHERE species_id = ? AND user_email = ?`, args: [Number(rating), sanitizeStr(comment || '', 1000), species_id, payload.email] });
+      return res.json({ message: 'อัปเดตรีวิวสำเร็จ' });
+    }
+    const userResult = await db.execute({ sql: 'SELECT name, nickname FROM users WHERE email = ?', args: [payload.email] });
+    const u = userResult.rows[0] as any;
+    const userName = u?.nickname || u?.name || (payload.email ?? '').split('@')[0] || 'ผู้ใช้';
+    await db.execute({ sql: 'INSERT INTO reviews (species_id, user_email, user_name, rating, comment) VALUES (?, ?, ?, ?, ?)', args: [species_id, payload.email!, userName, Number(rating), sanitizeStr(comment || '', 1000)] });
+    res.json({ message: 'เพิ่มรีวิวสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Add review failed' }); }
+});
+
+app.delete('/api/reviews/:id', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const payload = verifyJwt(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid token' });
+  const id = req.params['id'] as string;
+  try {
+    if (payload.role === 'admin') {
+      await db.execute({ sql: 'DELETE FROM reviews WHERE id = ?', args: [id] });
+    } else {
+      await db.execute({ sql: 'DELETE FROM reviews WHERE id = ? AND user_email = ?', args: [id, payload.email] });
+    }
+    res.json({ message: 'ลบรีวิวสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Delete review failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANCEL ORDER (user — pending only)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.put('/api/orders/:id/cancel', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const payload = verifyJwt(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid token' });
+  const id = req.params['id'] as string;
+  try {
+    const orderResult = await db.execute({ sql: 'SELECT * FROM orders WHERE id = ?', args: [id] });
+    if ((orderResult.rows as any[]).length === 0) return res.status(404).json({ error: 'ไม่พบคำสั่งซื้อ' });
+    const order = orderResult.rows[0] as any;
+    if (order.user_email !== payload.email && payload.role !== 'admin') return res.status(403).json({ error: 'ไม่มีสิทธิ์ยกเลิก' });
+    if (order.status !== 'pending') return res.status(400).json({ error: 'ยกเลิกได้เฉพาะออร์เดอร์ที่รอชำระเงินเท่านั้น' });
+    await db.execute({ sql: `UPDATE orders SET status = 'cancelled', updated_at = DATETIME('now') WHERE id = ?`, args: [id] });
+    const items = await db.execute({ sql: 'SELECT * FROM order_items WHERE order_id = ?', args: [id] });
+    for (const item of items.rows as any[]) {
+      try { await db.execute({ sql: 'UPDATE species SET stock = stock + ? WHERE id = ?', args: [item.quantity, item.species_id] }); } catch {}
+    }
+    res.json({ message: 'ยกเลิกคำสั่งซื้อสำเร็จ' });
+  } catch { res.status(500).json({ error: 'Cancel order failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORT ORDERS CSV (admin)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/orders/export', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const orders = await db.execute('SELECT * FROM orders ORDER BY created_at DESC');
+    const rows = orders.rows as any[];
+    const headers = ['ID', 'Email', 'Total (THB)', 'Status', 'Payment', 'Shipping Co', 'Tracking No', 'Est. Delivery', 'Note', 'Created At', 'Updated At'];
+    const csv = [
+      headers.join(','),
+      ...rows.map(o => [
+        o.id, o.user_email, o.total_amount, o.status, o.payment_method,
+        o.shipping_company || '', o.tracking_number || '', o.estimated_delivery || '',
+        (o.note || '').replace(/\n/g, ' '), o.created_at, o.updated_at,
+      ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')),
+    ].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="orders-${new Date().toISOString().split('T')[0]}.csv"`);
+    res.send('\uFEFF' + csv);
+  } catch { res.status(500).json({ error: 'Export failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MONTHLY STATS (admin — for dashboard chart)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/stats/monthly', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const result = await db.execute(`
+      SELECT
+        strftime('%Y-%m', created_at) as month,
+        COUNT(*) as order_count,
+        SUM(CASE WHEN status != 'cancelled' THEN total_amount ELSE 0 END) as revenue
+      FROM orders
+      GROUP BY strftime('%Y-%m', created_at)
+      ORDER BY month DESC
+      LIMIT 12
+    `);
+    res.json((result.rows as any[]).reverse());
+  } catch { res.status(500).json({ error: 'Stats failed' }); }
+});
+
 // Polling: get updated orders since timestamp
 app.get('/api/orders/poll', async (req: Request, res: Response) => {
   const email = req.query['email'] as string;
@@ -1044,6 +1191,15 @@ async function initDB() {
       quantity INTEGER NOT NULL DEFAULT 1,
       unit_price REAL NOT NULL DEFAULT 0,
       subtotal REAL NOT NULL DEFAULT 0
+    )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      species_id TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_name TEXT,
+      rating INTEGER NOT NULL CHECK(rating >= 1 AND rating <= 5),
+      comment TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     // migrate: add columns if missing
     const migrations = [
