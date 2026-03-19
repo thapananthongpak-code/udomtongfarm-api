@@ -838,8 +838,8 @@ app.post('/api/orders', async (req: Request, res: Response) => {
     });
     for (const item of items) {
       await db.execute({
-        sql: 'INSERT INTO order_items (order_id, species_id, species_name, species_image, species_type, quantity, unit_price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        args: [orderId, sanitizeStr(item.species_id), sanitizeStr(item.species_name || ''), sanitizeStr(item.species_image || '', 2000), sanitizeStr(item.species_type || ''), Number(item.quantity) || 1, Number(item.unit_price) || 0, Number(item.subtotal) || 0],
+        sql: 'INSERT INTO order_items (order_id, species_id, species_name, species_name_en, species_image, species_type, quantity, unit_price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [orderId, sanitizeStr(item.species_id), sanitizeStr(item.species_name || ''), sanitizeStr(item.species_name_en || ''), sanitizeStr(item.species_image || '', 2000), sanitizeStr(item.species_type || ''), Number(item.quantity) || 1, Number(item.unit_price) || 0, Number(item.subtotal) || 0],
       });
       // Reduce stock (non-blocking)
       try {
@@ -1186,12 +1186,14 @@ async function initDB() {
       order_id TEXT NOT NULL,
       species_id TEXT NOT NULL,
       species_name TEXT,
+      species_name_en TEXT,
       species_image TEXT,
       species_type TEXT,
       quantity INTEGER NOT NULL DEFAULT 1,
       unit_price REAL NOT NULL DEFAULT 0,
       subtotal REAL NOT NULL DEFAULT 0
     )`);
+    await db.execute(`ALTER TABLE order_items ADD COLUMN species_name_en TEXT`).catch(() => {});
     await db.execute(`CREATE TABLE IF NOT EXISTS reviews (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       species_id TEXT NOT NULL,
