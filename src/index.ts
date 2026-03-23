@@ -463,35 +463,31 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
     const adminResult = await db.execute({ sql: 'SELECT * FROM admins WHERE email = ?', args: [email] });
     if ((adminResult.rows as any[]).length > 0) {
       const admin = adminResult.rows[0] as any;
-      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
+      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch {}
       const gAdminToken = makeJwt({ email: admin.email, role: 'admin' });
-      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: gAdminToken, user: { ...admin, role: 'admin', avatar: photoURL || admin.avatar || null, token: gAdminToken } });
+      const { password: _ap, ...safeAdmin } = admin;
+      return res.json({ message: 'แอดมินเข้าสู่ระบบสำเร็จ', token: gAdminToken, user: { ...safeAdmin, role: 'admin', avatar: photoURL || admin.avatar || null, token: gAdminToken } });
     }
     const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
     if ((userResult.rows as any[]).length > 0) {
       const user = userResult.rows[0] as any;
-      // อัปเดต avatar ถ้า Google ส่งมา
       try { if (photoURL && photoURL !== user.avatar) { await db.execute({ sql: 'UPDATE users SET avatar = ? WHERE email = ?', args: [photoURL, email] }); } } catch {}
-      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
+      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch {}
       const gUserToken = makeJwt({ email: user.email, role: 'user' });
-      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', token: gUserToken, user: { ...user, role: 'user', avatar: photoURL || user.avatar || null, token: gUserToken } });
+      const { password: _up, ...safeUser } = user;
+      return res.json({ message: 'เข้าสู่ระบบสำเร็จ', token: gUserToken, user: { ...safeUser, role: 'user', avatar: photoURL || user.avatar || null, token: gUserToken } });
     }
     await db.execute({
       sql: 'INSERT INTO users (name, email, password, is_verified, pdpa_accepted, avatar) VALUES (?, ?, ?, 1, 1, ?)',
       args: [sanitizeStr(name) || email, email, hashPassword(uid), photoURL || null],
     });
     const newUser = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
-    const created = newUser.rows[0] as any;
-    try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [created.email, created.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
-    const gNewToken = makeJwt({ email: created.email, role: 'user' });
-    return res.json({ message: 'สร้างบัญชีและเข้าสู่ระบบสำเร็จ', token: gNewToken, user: { ...created, role: 'user', token: gNewToken } });
+    const { password: _np, ...safeNew } = newUser.rows[0] as any;
+    try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [safeNew.email, safeNew.name || ''] }); } catch {}
+    const gNewToken = makeJwt({ email: safeNew.email, role: 'user' });
+    return res.json({ message: 'สร้างบัญชีและเข้าสู่ระบบสำเร็จ', token: gNewToken, user: { ...safeNew, role: 'user', token: gNewToken } });
   } catch (e) { console.error('Google login error:', e); res.status(500).json({ error: 'Google login failed' }); }
 });
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH 2.0 (Direct — no Firebase SDK)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROFILE UPDATE
