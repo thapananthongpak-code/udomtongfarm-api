@@ -483,6 +483,16 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
 // GOOGLE OAUTH 2.0 (Direct — no Firebase SDK)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/** Debug: check OAuth config (remove after verification) */
+app.get('/debug/oauth', (_req: Request, res: Response) => {
+  res.json({
+    client_id_prefix: GOOGLE_CLIENT_ID ? GOOGLE_CLIENT_ID.slice(0, 30) + '...' : '(empty)',
+    client_secret_set: !!GOOGLE_CLIENT_SECRET,
+    callback_url: GOOGLE_CALLBACK_URL,
+    frontend_url: FRONTEND_URL,
+  });
+});
+
 /** Step 1: Redirect browser to Google consent screen */
 app.get('/auth/google', (_req: Request, res: Response) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
