@@ -653,7 +653,9 @@ app.get('/auth/google/callback', async (req: Request, res: Response) => {
     }
 
     const jwt = makeJwt({ email, role: finalRole });
-    const userPayload = { ...finalUser, role: finalRole, avatar: photoURL || finalUser.avatar || null, token: jwt };
+    // Never expose password/sensitive DB fields in redirect URL
+    const { password: _pw, pdpa_accepted: _pdpa, is_verified: _iv, ...safeUser } = finalUser as any;
+    const userPayload = { ...safeUser, role: finalRole, avatar: photoURL || finalUser.avatar || null, token: jwt };
     const userEncoded = encodeURIComponent(JSON.stringify(userPayload));
 
     res.redirect(`${FRONTEND_URL}/auth/callback?token=${jwt}&user=${userEncoded}`);
