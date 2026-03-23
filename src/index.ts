@@ -8,17 +8,15 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
-import { Resend } from 'resend';
+import nodemailer from 'nodemailer';
 import { createHash, createHmac } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
 const DB_URL       = (process.env.TURSO_DB_URL || '').trim();
 const DB_TOKEN     = (process.env.TURSO_DB_TOKEN || '').trim().replace(/\s/g, '');
-const RESEND_KEY   = (process.env.RESEND_API_KEY || '').trim();
-const RESEND_FROM  = (process.env.RESEND_FROM_EMAIL || 'Udomtong Farm <onboarding@resend.dev>').trim();
-
-const resend = RESEND_KEY ? new Resend(RESEND_KEY) : null;
+const EMAIL_USER   = (process.env.EMAIL_USER || '').trim();
+const EMAIL_PASS   = (process.env.EMAIL_PASS || '').trim();
 const ADMIN_SECRET = (process.env.ADMIN_SECRET || 'change_me').trim();
 const JWT_SECRET   = (process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025').trim();
 
@@ -55,18 +53,45 @@ if (!DB_URL || !DB_TOKEN) {
 // ─── Database ─────────────────────────────────────────────────────────────────
 const db = createClient({ url: DB_URL, authToken: DB_TOKEN });
 
-// ─── Email via Resend ──────────────────────────────────────────────────────────
+// ─── Email via Gmail SMTP ──────────────────────────────────────────────────────
+const gmailTransporter = EMAIL_PASS ? nodemailer.createTransport({
+  host: 'smtp.gmail.com', port: 587, secure: false,
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+}) : null;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)),
+  ]);
+}
+
+/** Strip HTML tags to produce a plain-text fallback */
+function htmlToText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  if (!resend) {
-    console.warn('[Email] RESEND_API_KEY not configured');
+  if (!gmailTransporter) {
+    console.warn('[Email] EMAIL_USER / EMAIL_PASS not configured');
     return false;
   }
   try {
-    const { error } = await resend.emails.send({ from: RESEND_FROM, to, subject, html });
-    if (error) { console.error('[Email] Resend error:', error); return false; }
+    await withTimeout(
+      gmailTransporter.sendMail({
+        from: `"Udomtong Farm" <${EMAIL_USER}>`,
+        to, subject, html,
+        text: htmlToText(html),
+        headers: { 'X-Mailer': 'Udomtong Farm Mailer', 'Importance': 'Normal' },
+      }),
+      15000,
+    );
     return true;
   } catch (err: any) {
-    console.error('[Email] Resend exception:', err?.message || err);
+    console.error('[Email] Gmail SMTP failed:', err?.message || err);
     return false;
   }
 }
