@@ -522,6 +522,7 @@ app.get('/auth/google/callback', async (req: Request, res: Response) => {
 
   try {
     // Exchange auth code for access token
+    console.log('[Google OAuth] Token exchange — client_id:', GOOGLE_CLIENT_ID.slice(0, 20) + '...', '| redirect_uri:', GOOGLE_CALLBACK_URL, '| secret_prefix:', GOOGLE_CLIENT_SECRET.slice(0, 10));
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
