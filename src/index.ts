@@ -79,7 +79,7 @@ const db = createClient({ url: DB_URL, authToken: DB_TOKEN });
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
   if (!SENDGRID_KEY) { console.warn('[Email] No SENDGRID_API_KEY set'); return false; }
   try {
-    await sgMail.send({ to, from: SENDGRID_FROM, subject, html });
+    await sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html });
     return true;
   } catch (err: any) {
     console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
@@ -362,7 +362,7 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 
     await sendEmail(
       email,
-      'รหัส OTP สมัครสมาชิก Udomtong Farm',
+      'Udomtong Farm — Verify your email',
       `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">ยินดีต้อนรับสู่ Udomtong Farm</h2><p>รหัส OTP สำหรับยืนยันอีเมลของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
     );
 
@@ -423,7 +423,7 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
       await db.execute({ sql: 'INSERT INTO otps (email, otp_code, expires_at) VALUES (?, ?, ?)', args: [admin.email, adminOtp, adminOtpExp] });
       if (process.env.NODE_ENV !== 'production') console.log(`\n[ADMIN-2FA] ${admin.email} => ${adminOtp}\n`);
       const admin2faHtml = `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f8fafc;border-radius:12px"><h2 style="color:#1d4ed8;margin:0 0 8px">🔐 Admin Login - 2FA Code</h2><p style="color:#374151;margin:0 0 24px">กรุณาใส่รหัส OTP ด้านล่างเพื่อเข้าสู่ระบบ Admin</p><div style="background:#fff;border:2px solid #3b82f6;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1d4ed8;letter-spacing:0.2em">${adminOtp}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">หมดอายุใน 15 นาที</div></div><p style="color:#6b7280;font-size:0.8rem;margin:0">หากไม่ใช่คุณที่กำลังล็อกอิน กรุณาเปลี่ยนรหัสผ่านทันที</p></div>`;
-      await sendEmail(admin.email, 'Udomtong Farm Admin 2FA Code', admin2faHtml);
+      await sendEmail(admin.email, 'Udomtong Farm — Admin verification code', admin2faHtml);
       return res.json({ needs_2fa: true, email: admin.email, message: 'ส่งรหัส OTP ไปยังอีเมลแอดมินแล้ว' });
     }
 
@@ -684,7 +684,7 @@ app.post('/api/forgot-password', authLimiter, async (req: Request, res: Response
 
     const emailSent = await sendEmail(
       email,
-      'รหัส OTP รีเซ็ตรหัสผ่าน Udomtong Farm',
+      'Udomtong Farm — Reset your password',
       `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">รีเซ็ตรหัสผ่าน</h2><p>รหัส OTP ของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
     );
 
