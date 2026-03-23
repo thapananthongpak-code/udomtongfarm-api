@@ -90,28 +90,28 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 }
 
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  // Primary: Gmail SMTP (10s timeout)
-  if (gmailTransporter) {
-    try {
-      await withTimeout(
-        gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html }),
-        10000,
-      );
-      return true;
-    } catch (err: any) {
-      console.error('[Email error] Gmail SMTP failed:', err?.message || err);
-    }
-  }
-  // Fallback: SendGrid (10s timeout)
+  // Primary: SendGrid HTTP API (not blocked by Railway, 8s timeout)
   if (SENDGRID_KEY) {
     try {
       await withTimeout(
         sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html }),
-        10000,
+        8000,
       );
       return true;
     } catch (err: any) {
       console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
+    }
+  }
+  // Fallback: Gmail SMTP (5s timeout — Railway may block SMTP port 587)
+  if (gmailTransporter) {
+    try {
+      await withTimeout(
+        gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html }),
+        5000,
+      );
+      return true;
+    } catch (err: any) {
+      console.error('[Email error] Gmail SMTP failed:', err?.message || err);
     }
   }
   console.warn('[Email] No email provider configured');
