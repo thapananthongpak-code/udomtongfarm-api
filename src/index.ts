@@ -9,6 +9,7 @@ import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
 import sgMail from '@sendgrid/mail';
+import nodemailer from 'nodemailer';
 import { createHash, createHmac } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -76,15 +77,32 @@ if (!DB_URL || !DB_TOKEN) {
 const db = createClient({ url: DB_URL, authToken: DB_TOKEN });
 
 // ─── Email ────────────────────────────────────────────────────────────────────
+const gmailTransporter = EMAIL_PASS ? nodemailer.createTransport({
+  host: 'smtp.gmail.com', port: 587, secure: false,
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+}) : null;
+
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  if (!SENDGRID_KEY) { console.warn('[Email] No SENDGRID_API_KEY set'); return false; }
-  try {
-    await sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html });
-    return true;
-  } catch (err: any) {
-    console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
-    return false;
+  // Primary: Gmail SMTP
+  if (gmailTransporter) {
+    try {
+      await gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html });
+      return true;
+    } catch (err: any) {
+      console.error('[Email error] Gmail SMTP failed:', err?.message || err);
+    }
   }
+  // Fallback: SendGrid
+  if (SENDGRID_KEY) {
+    try {
+      await sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html });
+      return true;
+    } catch (err: any) {
+      console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
+    }
+  }
+  console.warn('[Email] No email provider configured');
+  return false;
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
