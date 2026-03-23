@@ -1164,16 +1164,23 @@ setInterval(() => {
   }
 }, 60_000);
 
+/** Use JS-based redirect to avoid Railway reverse-proxy mangling Location headers */
+function jsRedirect(res: Response, url: string) {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><script>window.location.replace(${JSON.stringify(url)});</script></head><body></body></html>`);
+}
+
 async function handleGoogleOAuth(req: Request, res: Response) {
   const { code, error } = req.query as Record<string, string | undefined>;
 
   if (error) {
-    return res.redirect(`${FRONTEND_URL}/login?google_error=${encodeURIComponent(error)}`);
+    return jsRedirect(res, `${FRONTEND_URL}/login?google_error=${encodeURIComponent(error)}`);
   }
 
   if (!code) {
-    // Step 1: Initiate OAuth — redirect to Google
+    // Step 1: Initiate OAuth — redirect to Google (absolute URL, safe to use res.redirect)
     if (!GOOGLE_CLIENT_ID_VAR) return res.status(500).send('Google OAuth not configured');
+    console.log('[Google OAuth] Starting flow | CALLBACK:', GOOGLE_CALLBACK_URL_VAR, '| FRONTEND:', FRONTEND_URL);
     const params = new URLSearchParams({
       client_id: GOOGLE_CLIENT_ID_VAR,
       redirect_uri: GOOGLE_CALLBACK_URL_VAR,
@@ -1201,7 +1208,7 @@ async function handleGoogleOAuth(req: Request, res: Response) {
     const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
     if (!tokenData.access_token) {
       console.error('[Google OAuth] Token exchange failed:', tokenData);
-      return res.redirect(`${FRONTEND_URL}/login?google_error=token_exchange_failed`);
+      return jsRedirect(res, `${FRONTEND_URL}/login?google_error=token_exchange_failed`);
     }
 
     // Step 3: Get user profile from Google
@@ -1210,7 +1217,7 @@ async function handleGoogleOAuth(req: Request, res: Response) {
     });
     const gUser = await userRes.json() as { email?: string; name?: string; id?: string; picture?: string };
     const { email, name, id: uid, picture: photoURL } = gUser;
-    if (!email || !uid) return res.redirect(`${FRONTEND_URL}/login?google_error=missing_user_info`);
+    if (!email || !uid) return jsRedirect(res, `${FRONTEND_URL}/login?google_error=missing_user_info`);
 
     // Step 4: Create/update user in DB (same logic as /api/google-login)
     let userData: Record<string, unknown>;
@@ -1248,10 +1255,11 @@ async function handleGoogleOAuth(req: Request, res: Response) {
     // Step 5: Store user data in short-lived exchange code, redirect to frontend
     const authCode = randomBytes(24).toString('base64url').slice(0, 32);
     googleAuthCodes.set(authCode, { user: userData, expiresAt: Date.now() + 5 * 60_000 });
-    return res.redirect(`${FRONTEND_URL}/login?gat=${authCode}`);
+    console.log('[Google OAuth] Success — redirecting to frontend');
+    return jsRedirect(res, `${FRONTEND_URL}/login?gat=${authCode}`);
   } catch (e) {
     console.error('[Google OAuth] Callback error:', e);
-    return res.redirect(`${FRONTEND_URL}/login?google_error=server_error`);
+    return jsRedirect(res, `${FRONTEND_URL}/login?google_error=server_error`);
   }
 }
 
