@@ -82,20 +82,33 @@ const gmailTransporter = EMAIL_PASS ? nodemailer.createTransport({
   auth: { user: EMAIL_USER, pass: EMAIL_PASS },
 }) : null;
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)),
+  ]);
+}
+
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  // Primary: Gmail SMTP
+  // Primary: Gmail SMTP (10s timeout)
   if (gmailTransporter) {
     try {
-      await gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html });
+      await withTimeout(
+        gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html }),
+        10000,
+      );
       return true;
     } catch (err: any) {
       console.error('[Email error] Gmail SMTP failed:', err?.message || err);
     }
   }
-  // Fallback: SendGrid
+  // Fallback: SendGrid (10s timeout)
   if (SENDGRID_KEY) {
     try {
-      await sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html });
+      await withTimeout(
+        sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html }),
+        10000,
+      );
       return true;
     } catch (err: any) {
       console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
