@@ -9,7 +9,8 @@ import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
 import nodemailer from 'nodemailer';
-import { createHash, createHmac } from 'crypto';
+import sgMail from '@sendgrid/mail';
+import { createHash, createHmac, randomBytes } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
@@ -17,8 +18,17 @@ const DB_URL       = (process.env.TURSO_DB_URL || '').trim();
 const DB_TOKEN     = (process.env.TURSO_DB_TOKEN || '').trim().replace(/\s/g, '');
 const EMAIL_USER   = (process.env.EMAIL_USER || '').trim();
 const EMAIL_PASS   = (process.env.EMAIL_PASS || '').trim();
-const ADMIN_SECRET = (process.env.ADMIN_SECRET || 'change_me').trim();
-const JWT_SECRET   = (process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025').trim();
+const ADMIN_SECRET             = (process.env.ADMIN_SECRET             || 'change_me').trim();
+const JWT_SECRET               = (process.env.JWT_SECRET               || 'udomtong_jwt_secret_2025').trim();
+const GOOGLE_CLIENT_ID_VAR     = (process.env.GOOGLE_CLIENT_ID         || '').trim();
+const GOOGLE_CLIENT_SECRET_VAR = (process.env.GOOGLE_CLIENT_SECRET     || '').trim();
+const GOOGLE_CALLBACK_URL_VAR  = (process.env.GOOGLE_CALLBACK_URL      || 'http://localhost:3001/auth/google').trim();
+const FRONTEND_URL             = (process.env.FRONTEND_URL             || 'http://localhost:5173').trim();
+const SENDGRID_API_KEY_VAR     = (process.env.SENDGRID_API_KEY         || '').trim();
+const SENDGRID_FROM            = (process.env.SENDGRID_FROM_EMAIL      || EMAIL_USER).trim();
+
+// ─── Init SendGrid ─────────────────────────────────────────────────────────────
+if (SENDGRID_API_KEY_VAR) sgMail.setApiKey(SENDGRID_API_KEY_VAR);
 
 
 // ─── JWT helpers ──────────────────────────────────────────────────────────────
@@ -75,8 +85,21 @@ function htmlToText(html: string): string {
 }
 
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
+  // Primary: SendGrid
+  if (SENDGRID_API_KEY_VAR) {
+    try {
+      await withTimeout(
+        sgMail.send({ to, from: SENDGRID_FROM || EMAIL_USER, subject, html, text: htmlToText(html) }),
+        15000,
+      );
+      return true;
+    } catch (err: any) {
+      console.error('[Email] SendGrid failed:', err?.message || err);
+    }
+  }
+  // Fallback: Gmail SMTP
   if (!gmailTransporter) {
-    console.warn('[Email] EMAIL_USER / EMAIL_PASS not configured');
+    console.warn('[Email] No email provider configured');
     return false;
   }
   try {
@@ -1127,6 +1150,125 @@ app.get('/api/orders/poll', async (req: Request, res: Response) => {
     }
     res.json(result);
   } catch { res.status(500).json({ error: 'Poll failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GOOGLE OAUTH (backend-proxied — no Firebase dependency)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Short-lived exchange codes (5-min TTL) — avoids putting tokens in URL history
+const googleAuthCodes = new Map<string, { user: Record<string, unknown>; expiresAt: number }>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, entry] of googleAuthCodes.entries()) {
+    if (entry.expiresAt < now) googleAuthCodes.delete(code);
+  }
+}, 60_000);
+
+async function handleGoogleOAuth(req: Request, res: Response) {
+  const { code, error } = req.query as Record<string, string | undefined>;
+
+  if (error) {
+    return res.redirect(`${FRONTEND_URL}/login?google_error=${encodeURIComponent(error)}`);
+  }
+
+  if (!code) {
+    // Step 1: Initiate OAuth — redirect to Google
+    if (!GOOGLE_CLIENT_ID_VAR) return res.status(500).send('Google OAuth not configured');
+    const params = new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID_VAR,
+      redirect_uri: GOOGLE_CALLBACK_URL_VAR,
+      response_type: 'code',
+      scope: 'openid email profile',
+      access_type: 'online',
+      prompt: 'select_account',
+    });
+    return res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+  }
+
+  // Step 2: Exchange code for access token
+  try {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID_VAR,
+        client_secret: GOOGLE_CLIENT_SECRET_VAR,
+        redirect_uri: GOOGLE_CALLBACK_URL_VAR,
+        grant_type: 'authorization_code',
+      }).toString(),
+    });
+    const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
+    if (!tokenData.access_token) {
+      console.error('[Google OAuth] Token exchange failed:', tokenData);
+      return res.redirect(`${FRONTEND_URL}/login?google_error=token_exchange_failed`);
+    }
+
+    // Step 3: Get user profile from Google
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const gUser = await userRes.json() as { email?: string; name?: string; id?: string; picture?: string };
+    const { email, name, id: uid, picture: photoURL } = gUser;
+    if (!email || !uid) return res.redirect(`${FRONTEND_URL}/login?google_error=missing_user_info`);
+
+    // Step 4: Create/update user in DB (same logic as /api/google-login)
+    let userData: Record<string, unknown>;
+    let token: string;
+
+    const adminResult = await db.execute({ sql: 'SELECT * FROM admins WHERE email = ?', args: [email] });
+    if ((adminResult.rows as any[]).length > 0) {
+      const admin = adminResult.rows[0] as any;
+      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch {}
+      token = makeJwt({ email: admin.email, role: 'admin' });
+      const { password: _ap, ...safeAdmin } = admin;
+      userData = { ...safeAdmin, role: 'admin', avatar: photoURL || admin.avatar || null, token };
+    } else {
+      const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
+      if ((userResult.rows as any[]).length > 0) {
+        const user = userResult.rows[0] as any;
+        try { if (photoURL && photoURL !== user.avatar) await db.execute({ sql: 'UPDATE users SET avatar = ? WHERE email = ?', args: [photoURL, email] }); } catch {}
+        try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch {}
+        token = makeJwt({ email: user.email, role: 'user' });
+        const { password: _up, ...safeUser } = user;
+        userData = { ...safeUser, role: 'user', avatar: photoURL || user.avatar || null, token };
+      } else {
+        await db.execute({
+          sql: 'INSERT INTO users (name, email, password, is_verified, pdpa_accepted, avatar) VALUES (?, ?, ?, 1, 1, ?)',
+          args: [sanitizeStr(name) || email, email, hashPassword(uid), photoURL || null],
+        });
+        const newUserResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
+        const { password: _np, ...safeNew } = newUserResult.rows[0] as any;
+        try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [safeNew.email, safeNew.name || ''] }); } catch {}
+        token = makeJwt({ email: safeNew.email, role: 'user' });
+        userData = { ...safeNew, role: 'user', token };
+      }
+    }
+
+    // Step 5: Store user data in short-lived exchange code, redirect to frontend
+    const authCode = randomBytes(24).toString('base64url').slice(0, 32);
+    googleAuthCodes.set(authCode, { user: userData, expiresAt: Date.now() + 5 * 60_000 });
+    return res.redirect(`${FRONTEND_URL}/login?gat=${authCode}`);
+  } catch (e) {
+    console.error('[Google OAuth] Callback error:', e);
+    return res.redirect(`${FRONTEND_URL}/login?google_error=server_error`);
+  }
+}
+
+app.get('/auth/google', handleGoogleOAuth);
+app.get('/auth/google/callback', handleGoogleOAuth);
+
+// Frontend exchanges the short-lived code for user data (one-time use)
+app.get('/api/auth/google/exchange', (req: Request, res: Response) => {
+  const { code } = req.query as { code?: string };
+  if (!code) return res.status(400).json({ error: 'Missing code' });
+  const entry = googleAuthCodes.get(code);
+  if (!entry || entry.expiresAt < Date.now()) {
+    googleAuthCodes.delete(code);
+    return res.status(401).json({ error: 'Code expired or invalid' });
+  }
+  googleAuthCodes.delete(code);
+  res.json({ user: entry.user });
 });
 
 // ─── Global error handler ────────────────────────────────────────────────────
