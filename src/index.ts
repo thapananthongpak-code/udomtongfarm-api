@@ -14,22 +14,24 @@ import { createHash, createHmac } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
-const DB_URL       = process.env.TURSO_DB_URL!;
-const DB_TOKEN     = process.env.TURSO_DB_TOKEN!.replace(/\s/g, '');
-const EMAIL_USER      = process.env.EMAIL_USER!;
-const EMAIL_PASS      = process.env.EMAIL_PASS!;
-const SENDGRID_KEY    = process.env.SENDGRID_API_KEY || '';
-const SENDGRID_FROM   = process.env.SENDGRID_FROM_EMAIL || EMAIL_USER;
+const DB_URL       = (process.env.TURSO_DB_URL || '').trim();
+const DB_TOKEN     = (process.env.TURSO_DB_TOKEN || '').trim().replace(/\s/g, '');
+const EMAIL_USER      = (process.env.EMAIL_USER || '').trim();
+const EMAIL_PASS      = (process.env.EMAIL_PASS || '').trim();
+const SENDGRID_KEY    = (process.env.SENDGRID_API_KEY || '').trim();
+const SENDGRID_FROM   = (process.env.SENDGRID_FROM_EMAIL || EMAIL_USER).trim();
 
 if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change_me';
-const JWT_SECRET   = process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025';
+const ADMIN_SECRET = (process.env.ADMIN_SECRET || 'change_me').trim();
+const JWT_SECRET   = (process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025').trim();
 
 // ─── Google OAuth 2.0 (no Firebase) ──────────────────────────────────────────
-const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || '';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-const GOOGLE_CALLBACK_URL  = process.env.GOOGLE_CALLBACK_URL  || 'http://localhost:3001/auth/google/callback';
-const FRONTEND_URL         = process.env.FRONTEND_URL         || 'http://localhost:5173';
+const GOOGLE_CLIENT_ID     = (process.env.GOOGLE_CLIENT_ID     || '').trim();
+const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const GOOGLE_CALLBACK_URL  = (process.env.GOOGLE_CALLBACK_URL  || 'http://localhost:3001/auth/google/callback').trim();
+// Validate FRONTEND_URL — ensure it starts with http to prevent malformed redirects
+const _rawFrontend = (process.env.FRONTEND_URL || 'http://localhost:5173').trim();
+const FRONTEND_URL = /^https?:\/\//.test(_rawFrontend) ? _rawFrontend : 'http://localhost:5173';
 
 /** Stateless CSRF token for OAuth state param (HMAC-SHA256, expires 10 min) */
 function makeOAuthState(): string {
@@ -89,29 +91,61 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+/** Strip HTML tags to produce a plain-text version of an email body */
+function htmlToText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  // Primary: SendGrid HTTP API (not blocked by Railway, 8s timeout)
-  if (SENDGRID_KEY) {
-    try {
-      await withTimeout(
-        sgMail.send({ to, from: { email: SENDGRID_FROM, name: 'Udomtong Farm' }, subject, html }),
-        8000,
-      );
-      return true;
-    } catch (err: any) {
-      console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
-    }
-  }
-  // Fallback: Gmail SMTP (5s timeout — Railway may block SMTP port 587)
+  const text = htmlToText(html);
+  const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@udomtongfarm.com>`;
+
+  // Primary: Gmail SMTP — longer timeout to prevent spurious fallback to SendGrid
   if (gmailTransporter) {
     try {
       await withTimeout(
-        gmailTransporter.sendMail({ from: `"Udomtong Farm" <${EMAIL_USER}>`, to, subject, html }),
-        5000,
+        gmailTransporter.sendMail({
+          from: `"Udomtong Farm" <${EMAIL_USER}>`,
+          to,
+          subject,
+          html,
+          text,
+          headers: {
+            'Message-ID': messageId,
+            'X-Mailer': 'Udomtong Farm Mailer',
+            'X-Priority': '3',
+            'Importance': 'Normal',
+          },
+        }),
+        15000,
       );
       return true;
     } catch (err: any) {
       console.error('[Email error] Gmail SMTP failed:', err?.message || err);
+    }
+  }
+  // Fallback: SendGrid — only works reliably if SENDGRID_FROM_EMAIL is NOT a @gmail.com address
+  if (SENDGRID_KEY) {
+    try {
+      await withTimeout(
+        sgMail.send({
+          to,
+          from: { email: SENDGRID_FROM, name: 'Udomtong Farm' },
+          subject,
+          html,
+          text,
+          headers: { 'X-Priority': '3', 'Importance': 'Normal' },
+        }),
+        12000,
+      );
+      return true;
+    } catch (err: any) {
+      console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
     }
   }
   console.warn('[Email] No email provider configured');
@@ -393,8 +427,8 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 
     await sendEmail(
       email,
-      'Udomtong Farm — Verify your email',
-      `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">ยินดีต้อนรับสู่ Udomtong Farm</h2><p>รหัส OTP สำหรับยืนยันอีเมลของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
+      '[Udomtong Farm] รหัสยืนยันอีเมลของคุณ',
+      `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 8px;color:#374151;font-size:1rem">สวัสดี,</p><p style="margin:0 0 24px;color:#374151;font-size:1rem">รหัส OTP สำหรับยืนยันอีเมลของคุณ:</p><div style="background:#f0fdf4;border:2px solid #2d6a4f;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1b4332;letter-spacing:10px;font-family:monospace">${otpCode}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ หมดอายุใน 15 นาที</div></div><p style="margin:0;color:#9ca3af;font-size:0.8rem">หากคุณไม่ได้สมัครสมาชิก Udomtong Farm กรุณาเพิกเฉยต่ออีเมลนี้</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · อีเมลนี้ส่งอัตโนมัติ กรุณาอย่าตอบกลับ</p></td></tr></table></td></tr></table></body></html>`,
     );
 
     res.json({ message: 'สมัครสมาชิกสำเร็จ! กรุณายืนยัน OTP ทางอีเมล' });
@@ -453,8 +487,8 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
       await db.execute({ sql: 'DELETE FROM otps WHERE email = ?', args: [admin.email] });
       await db.execute({ sql: 'INSERT INTO otps (email, otp_code, expires_at) VALUES (?, ?, ?)', args: [admin.email, adminOtp, adminOtpExp] });
       if (process.env.NODE_ENV !== 'production') console.log(`\n[ADMIN-2FA] ${admin.email} => ${adminOtp}\n`);
-      const admin2faHtml = `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f8fafc;border-radius:12px"><h2 style="color:#1d4ed8;margin:0 0 8px">🔐 Admin Login - 2FA Code</h2><p style="color:#374151;margin:0 0 24px">กรุณาใส่รหัส OTP ด้านล่างเพื่อเข้าสู่ระบบ Admin</p><div style="background:#fff;border:2px solid #3b82f6;border-radius:12px;padding:24px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1d4ed8;letter-spacing:0.2em">${adminOtp}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">หมดอายุใน 15 นาที</div></div><p style="color:#6b7280;font-size:0.8rem;margin:0">หากไม่ใช่คุณที่กำลังล็อกอิน กรุณาเปลี่ยนรหัสผ่านทันที</p></div>`;
-      await sendEmail(admin.email, 'Udomtong Farm — Admin verification code', admin2faHtml);
+      const admin2faHtml = `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1e3a8a;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🔐 Udomtong Farm — Admin</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 24px;color:#374151;font-size:1rem">กรุณาใส่รหัส OTP ด้านล่างเพื่อเข้าสู่ระบบ Admin</p><div style="background:#eff6ff;border:2px solid #3b82f6;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1d4ed8;letter-spacing:10px;font-family:monospace">${adminOtp}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ หมดอายุใน 15 นาที</div></div><p style="margin:0;color:#ef4444;font-size:0.85rem;font-weight:600">หากไม่ใช่คุณที่กำลังล็อกอิน กรุณาเปลี่ยนรหัสผ่านทันที</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · Admin Security Alert</p></td></tr></table></td></tr></table></body></html>`;
+      await sendEmail(admin.email, '[Udomtong Farm] Admin Login — รหัส 2FA ของคุณ', admin2faHtml);
       return res.json({ needs_2fa: true, email: admin.email, message: 'ส่งรหัส OTP ไปยังอีเมลแอดมินแล้ว' });
     }
 
@@ -715,8 +749,8 @@ app.post('/api/forgot-password', authLimiter, async (req: Request, res: Response
 
     const emailSent = await sendEmail(
       email,
-      'Udomtong Farm — Reset your password',
-      `<div style="font-family:Arial,sans-serif;padding:20px;max-width:400px"><h2 style="color:#1b4332">รีเซ็ตรหัสผ่าน</h2><p>รหัส OTP ของคุณคือ:</p><div style="font-size:2.5rem;font-weight:900;color:#2d6a4f;letter-spacing:8px;margin:16px 0">${otpCode}</div><p style="color:#666;font-size:0.9rem">รหัสนี้จะหมดอายุใน 15 นาที</p></div>`,
+      '[Udomtong Farm] รหัสรีเซ็ตรหัสผ่านของคุณ',
+      `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 8px;color:#374151;font-size:1rem">สวัสดี,</p><p style="margin:0 0 24px;color:#374151;font-size:1rem">รหัส OTP สำหรับรีเซ็ตรหัสผ่านของคุณ:</p><div style="background:#fff7ed;border:2px solid #ea580c;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#c2410c;letter-spacing:10px;font-family:monospace">${otpCode}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ หมดอายุใน 15 นาที</div></div><p style="margin:0;color:#9ca3af;font-size:0.8rem">หากคุณไม่ได้ขอรีเซ็ตรหัสผ่าน กรุณาเพิกเฉยต่ออีเมลนี้</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · อีเมลนี้ส่งอัตโนมัติ กรุณาอย่าตอบกลับ</p></td></tr></table></td></tr></table></body></html>`,
     );
 
     res.json({ message: 'ส่ง OTP แล้ว', emailSent });
