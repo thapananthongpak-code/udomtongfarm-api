@@ -8,43 +8,20 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
-import sgMail from '@sendgrid/mail';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import { createHash, createHmac } from 'crypto';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
 const DB_URL       = (process.env.TURSO_DB_URL || '').trim();
 const DB_TOKEN     = (process.env.TURSO_DB_TOKEN || '').trim().replace(/\s/g, '');
-const EMAIL_USER      = (process.env.EMAIL_USER || '').trim();
-const EMAIL_PASS      = (process.env.EMAIL_PASS || '').trim();
-const SENDGRID_KEY    = (process.env.SENDGRID_API_KEY || '').trim();
-const SENDGRID_FROM   = (process.env.SENDGRID_FROM_EMAIL || EMAIL_USER).trim();
+const RESEND_KEY   = (process.env.RESEND_API_KEY || '').trim();
+const RESEND_FROM  = (process.env.RESEND_FROM_EMAIL || 'Udomtong Farm <onboarding@resend.dev>').trim();
 
-if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
+const resend = RESEND_KEY ? new Resend(RESEND_KEY) : null;
 const ADMIN_SECRET = (process.env.ADMIN_SECRET || 'change_me').trim();
 const JWT_SECRET   = (process.env.JWT_SECRET   || 'udomtong_jwt_secret_2025').trim();
 
-// ─── Google OAuth 2.0 (no Firebase) ──────────────────────────────────────────
-const GOOGLE_CLIENT_ID     = (process.env.GOOGLE_CLIENT_ID     || '').trim();
-const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
-const GOOGLE_CALLBACK_URL  = (process.env.GOOGLE_CALLBACK_URL  || 'http://localhost:3001/auth/google/callback').trim();
-// Validate FRONTEND_URL — ensure it starts with http to prevent malformed redirects
-const _rawFrontend = (process.env.FRONTEND_URL || 'http://localhost:5173').trim();
-const FRONTEND_URL = /^https?:\/\//.test(_rawFrontend) ? _rawFrontend : 'http://localhost:5173';
-
-/** Stateless CSRF token for OAuth state param (HMAC-SHA256, expires 10 min) */
-function makeOAuthState(): string {
-  const ts = Date.now().toString();
-  const sig = createHmac('sha256', JWT_SECRET).update(ts).digest('hex').slice(0, 20);
-  return `${ts}.${sig}`;
-}
-function verifyOAuthState(state: string): boolean {
-  const [ts, sig] = (state || '').split('.');
-  if (!ts || !sig) return false;
-  const expected = createHmac('sha256', JWT_SECRET).update(ts).digest('hex').slice(0, 20);
-  return sig === expected && Date.now() - parseInt(ts) < 10 * 60 * 1000;
-}
 
 // ─── JWT helpers ──────────────────────────────────────────────────────────────
 function b64url(str: string) {
@@ -78,78 +55,20 @@ if (!DB_URL || !DB_TOKEN) {
 // ─── Database ─────────────────────────────────────────────────────────────────
 const db = createClient({ url: DB_URL, authToken: DB_TOKEN });
 
-// ─── Email ────────────────────────────────────────────────────────────────────
-const gmailTransporter = EMAIL_PASS ? nodemailer.createTransport({
-  host: 'smtp.gmail.com', port: 587, secure: false,
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-}) : null;
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)),
-  ]);
-}
-
-/** Strip HTML tags to produce a plain-text version of an email body */
-function htmlToText(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
-    .replace(/\n{3,}/g, '\n\n').trim();
-}
-
+// ─── Email via Resend ──────────────────────────────────────────────────────────
 async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
-  const text = htmlToText(html);
-  const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@udomtongfarm.com>`;
-
-  // Primary: Gmail SMTP — longer timeout to prevent spurious fallback to SendGrid
-  if (gmailTransporter) {
-    try {
-      await withTimeout(
-        gmailTransporter.sendMail({
-          from: `"Udomtong Farm" <${EMAIL_USER}>`,
-          to,
-          subject,
-          html,
-          text,
-          headers: {
-            'Message-ID': messageId,
-            'X-Mailer': 'Udomtong Farm Mailer',
-            'X-Priority': '3',
-            'Importance': 'Normal',
-          },
-        }),
-        15000,
-      );
-      return true;
-    } catch (err: any) {
-      console.error('[Email error] Gmail SMTP failed:', err?.message || err);
-    }
+  if (!resend) {
+    console.warn('[Email] RESEND_API_KEY not configured');
+    return false;
   }
-  // Fallback: SendGrid — only works reliably if SENDGRID_FROM_EMAIL is NOT a @gmail.com address
-  if (SENDGRID_KEY) {
-    try {
-      await withTimeout(
-        sgMail.send({
-          to,
-          from: { email: SENDGRID_FROM, name: 'Udomtong Farm' },
-          subject,
-          html,
-          text,
-          headers: { 'X-Priority': '3', 'Importance': 'Normal' },
-        }),
-        12000,
-      );
-      return true;
-    } catch (err: any) {
-      console.error('[Email error] SendGrid failed:', err?.response?.body || err?.message || err);
-    }
+  try {
+    const { error } = await resend.emails.send({ from: RESEND_FROM, to, subject, html });
+    if (error) { console.error('[Email] Resend error:', error); return false; }
+    return true;
+  } catch (err: any) {
+    console.error('[Email] Resend exception:', err?.message || err);
+    return false;
   }
-  console.warn('[Email] No email provider configured');
-  return false;
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -548,122 +467,6 @@ app.post('/api/google-login', async (req: Request, res: Response) => {
 // GOOGLE OAUTH 2.0 (Direct — no Firebase SDK)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/** Debug: check OAuth config (remove after verification) */
-app.get('/debug/oauth', (_req: Request, res: Response) => {
-  res.json({
-    client_id_prefix: GOOGLE_CLIENT_ID ? GOOGLE_CLIENT_ID.slice(0, 30) + '...' : '(empty)',
-    client_secret_set: !!GOOGLE_CLIENT_SECRET,
-    callback_url: GOOGLE_CALLBACK_URL,
-    frontend_url: FRONTEND_URL,
-  });
-});
-
-/** Step 1: Redirect browser to Google consent screen */
-app.get('/auth/google', (_req: Request, res: Response) => {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-    return res.status(500).json({ error: 'Google OAuth not configured on server' });
-  }
-  const params = new URLSearchParams({
-    client_id:     GOOGLE_CLIENT_ID,
-    redirect_uri:  GOOGLE_CALLBACK_URL,
-    response_type: 'code',
-    scope:         'email profile',
-    access_type:   'online',
-    state:         makeOAuthState(),
-  });
-  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
-});
-
-/** Step 2: Google redirects here with ?code — exchange for user info, issue JWT */
-app.get('/auth/google/callback', async (req: Request, res: Response) => {
-  const { code, state, error } = req.query as Record<string, string>;
-
-  if (error || !code) {
-    return res.redirect(`${FRONTEND_URL}/login?error=google_cancelled`);
-  }
-  if (!verifyOAuthState(state || '')) {
-    return res.redirect(`${FRONTEND_URL}/login?error=google_invalid_state`);
-  }
-
-  try {
-    // Exchange auth code for access token
-    console.log('[Google OAuth] Token exchange — client_id_len:', GOOGLE_CLIENT_ID.length, '| secret_len:', GOOGLE_CLIENT_SECRET.length, '| secret_prefix:', GOOGLE_CLIENT_SECRET.slice(0, 12), '| redirect_uri:', GOOGLE_CALLBACK_URL);
-    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        code,
-        client_id:     GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri:  GOOGLE_CALLBACK_URL,
-        grant_type:    'authorization_code',
-      }).toString(),
-    });
-    const tokenData = await tokenRes.json() as { access_token?: string };
-    if (!tokenData.access_token) {
-      console.error('[Google OAuth] Token exchange failed:', tokenData);
-      return res.redirect(`${FRONTEND_URL}/login?error=google_failed`);
-    }
-
-    // Fetch Google user profile
-    const profileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
-    });
-    const profile = await profileRes.json() as {
-      email?: string; name?: string; picture?: string; id?: string;
-    };
-
-    const { email, name, picture: photoURL, id: googleId } = profile;
-    if (!email || !isValidEmail(email)) {
-      return res.redirect(`${FRONTEND_URL}/login?error=google_no_email`);
-    }
-
-    // Find or create user (same logic as /api/google-login)
-    let finalUser: Record<string, unknown>;
-    let finalRole: 'admin' | 'user';
-
-    const adminResult = await db.execute({ sql: 'SELECT * FROM admins WHERE email = ?', args: [email] });
-    if ((adminResult.rows as any[]).length > 0) {
-      finalUser = adminResult.rows[0] as any;
-      finalRole = 'admin';
-      try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [email, name || ''] }); } catch {}
-    } else {
-      const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
-      if ((userResult.rows as any[]).length > 0) {
-        finalUser = { ...(userResult.rows[0] as any) };
-        finalRole = 'user';
-        try {
-          if (photoURL && photoURL !== finalUser.avatar) {
-            await db.execute({ sql: 'UPDATE users SET avatar = ? WHERE email = ?', args: [photoURL, email] });
-            finalUser.avatar = photoURL;
-          }
-        } catch {}
-        try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [email, name || ''] }); } catch {}
-      } else {
-        // Auto-create new account from Google profile
-        await db.execute({
-          sql: 'INSERT INTO users (name, email, password, is_verified, pdpa_accepted, avatar) VALUES (?, ?, ?, 1, 1, ?)',
-          args: [sanitizeStr(name) || email, email, hashPassword(googleId || email), photoURL || null],
-        });
-        const created = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
-        finalUser = created.rows[0] as any;
-        finalRole = 'user';
-        try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [email, name || ''] }); } catch {}
-      }
-    }
-
-    const jwt = makeJwt({ email, role: finalRole });
-    // Never expose password/sensitive DB fields in redirect URL
-    const { password: _pw, pdpa_accepted: _pdpa, is_verified: _iv, ...safeUser } = finalUser as any;
-    const userPayload = { ...safeUser, role: finalRole, avatar: photoURL || finalUser.avatar || null, token: jwt };
-    const userEncoded = encodeURIComponent(JSON.stringify(userPayload));
-
-    res.redirect(`${FRONTEND_URL}/auth/callback?token=${jwt}&user=${userEncoded}`);
-  } catch (e) {
-    console.error('[Google OAuth] Callback error:', e);
-    res.redirect(`${FRONTEND_URL}/login?error=google_failed`);
-  }
-});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROFILE UPDATE
