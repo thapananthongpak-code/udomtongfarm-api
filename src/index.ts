@@ -138,7 +138,10 @@ const app = express();
 
 // Security: restrict CORS to allowed origins
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: ${origin} not allowed`));
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Lang'],
   credentials: true,
@@ -378,7 +381,7 @@ app.delete('/api/species/:id', async (req: Request, res: Response) => {
 // REGISTER
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
-  const { email, password, name, nickname, phone, birthDate, pdpa, avatar, addressLine, district, province, postalCode } = req.body;
+  const { email, password, name, nickname, phone, birthDate, pdpa, avatar } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -444,6 +447,37 @@ app.post('/api/verify-otp', authLimiter, async (req: Request, res: Response) => 
     }
     res.json({ message: 'ยืนยันอีเมลสำเร็จ!' });
   } catch { res.status(500).json({ error: 'Verify failed' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESEND OTP (registration verification)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/resend-otp', authLimiter, async (req: Request, res: Response) => {
+  const { email } = req.body;
+  if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'Invalid email' });
+  try {
+    const userResult = await db.execute({ sql: 'SELECT is_verified FROM users WHERE email = ?', args: [email] });
+    if ((userResult.rows as any[]).length === 0) return res.status(404).json({ error: 'Email not found' });
+    if ((userResult.rows[0] as any).is_verified) return res.status(400).json({ error: 'Email already verified' });
+
+    await db.execute({ sql: 'DELETE FROM otps WHERE email = ?', args: [email] });
+    const otpCode   = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60000).toISOString();
+    await db.execute({ sql: 'INSERT INTO otps (email, otp_code, expires_at) VALUES (?, ?, ?)', args: [email, otpCode, expiresAt] });
+
+    if (process.env.NODE_ENV !== 'production') console.log(`\n[OTP-RESEND] ${email} => ${otpCode}\n`);
+
+    const emailSent = await sendEmail(
+      email,
+      'Verify Your Email — Udomtong Farm',
+      `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 24px;color:#374151;font-size:1rem">Your new verification OTP:</p><div style="background:#f0fdf4;border:2px solid #2d6a4f;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1b4332;letter-spacing:10px;font-family:monospace">${otpCode}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ Expires in 15 minutes</div></div><p style="margin:0;color:#9ca3af;font-size:0.8rem">If you did not request this, please ignore this email.</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · Automated email, please do not reply.</p></td></tr></table></td></tr></table></body></html>`,
+    );
+
+    res.json({ message: 'OTP resent', emailSent });
+  } catch (e) {
+    console.error('Resend OTP error:', e);
+    res.status(500).json({ error: 'Failed to resend OTP' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -615,8 +649,8 @@ app.post('/api/reset-password', authLimiter, async (req: Request, res: Response)
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALL USERS (admin only)
 // ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/users', async (_req: Request, res: Response) => {
-  // Note: we might want to check for admin auth header here, but leaving as is for now if it's protected on front
+app.get('/api/users', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const result = await db.execute(
       'SELECT id, name, nickname, email, phone, birth_date, is_verified, pdpa_accepted, avatar FROM users ORDER BY id DESC'
@@ -691,7 +725,8 @@ app.get('/api/deleted-users', async (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // PASSWORD CHANGE LOG (admin only)
 // ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/password-change-log', async (_req: Request, res: Response) => {
+app.get('/api/password-change-log', async (req: Request, res: Response) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const result = await db.execute(
       'SELECT * FROM password_change_log ORDER BY id DESC LIMIT 200'
@@ -852,10 +887,16 @@ app.delete('/api/addresses/:id', async (req: Request, res: Response) => {
 // ORDERS — create, view (user + admin)
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/orders', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const payload = verifyJwt(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
+
   const { user_email, items, total_amount, payment_method, shipping_address, shipping_company, note } = req.body;
   if (!user_email || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
+  if (payload.email !== user_email) return res.status(403).json({ error: 'Forbidden' });
   const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
   try {
     await db.execute({
