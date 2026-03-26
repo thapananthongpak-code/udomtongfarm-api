@@ -85,7 +85,18 @@ async function sendEmail(to: string, subject: string, html: string): Promise<boo
   if (SENDGRID_API_KEY_VAR) {
     try {
       await withTimeout(
-        sgMail.send({ to, from: SENDGRID_FROM || EMAIL_USER, subject, html, text: htmlToText(html) }),
+        sgMail.send({
+          to,
+          from: { email: SENDGRID_FROM || EMAIL_USER, name: 'Udomtong Farm' },
+          subject,
+          html,
+          text: htmlToText(html),
+          headers: {
+            'Precedence': 'transactional',
+            'Auto-Submitted': 'auto-generated',
+            'List-Unsubscribe': `<mailto:${SENDGRID_FROM || EMAIL_USER}?subject=unsubscribe>`,
+          },
+        }),
         15000,
       );
       return true;
@@ -108,6 +119,9 @@ async function sendEmail(to: string, subject: string, html: string): Promise<boo
           'Reply-To': EMAIL_USER,
           'X-Priority': '3',
           'Precedence': 'transactional',
+          'Auto-Submitted': 'auto-generated',
+          'List-Unsubscribe': `<mailto:${EMAIL_USER}?subject=unsubscribe>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
         },
       }),
       15000,
@@ -394,7 +408,7 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 
     await sendEmail(
       email,
-      'รหัสยืนยันอีเมลของคุณ - Udomtong Farm',
+      'Verify Your Email — Udomtong Farm',
       `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 8px;color:#374151;font-size:1rem">สวัสดี,</p><p style="margin:0 0 24px;color:#374151;font-size:1rem">รหัส OTP สำหรับยืนยันอีเมลของคุณ:</p><div style="background:#f0fdf4;border:2px solid #2d6a4f;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#1b4332;letter-spacing:10px;font-family:monospace">${otpCode}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ หมดอายุใน 15 นาที</div></div><p style="margin:0;color:#9ca3af;font-size:0.8rem">หากคุณไม่ได้สมัครสมาชิก Udomtong Farm กรุณาเพิกเฉยต่ออีเมลนี้</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · อีเมลนี้ส่งอัตโนมัติ กรุณาอย่าตอบกลับ</p></td></tr></table></td></tr></table></body></html>`,
     );
 
@@ -558,7 +572,7 @@ app.post('/api/forgot-password', authLimiter, async (req: Request, res: Response
 
     const emailSent = await sendEmail(
       email,
-      'รหัสรีเซ็ตรหัสผ่านของคุณ - Udomtong Farm',
+      'Reset Your Password — Udomtong Farm',
       `<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,Helvetica,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#ffffff;font-size:1.3rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:32px"><p style="margin:0 0 8px;color:#374151;font-size:1rem">สวัสดี,</p><p style="margin:0 0 24px;color:#374151;font-size:1rem">รหัส OTP สำหรับรีเซ็ตรหัสผ่านของคุณ:</p><div style="background:#fff7ed;border:2px solid #ea580c;border-radius:10px;padding:20px;text-align:center;margin:0 0 24px"><div style="font-size:2.5rem;font-weight:900;color:#c2410c;letter-spacing:10px;font-family:monospace">${otpCode}</div><div style="color:#6b7280;font-size:0.85rem;margin-top:8px">⏱ หมดอายุใน 15 นาที</div></div><p style="margin:0;color:#9ca3af;font-size:0.8rem">หากคุณไม่ได้ขอรีเซ็ตรหัสผ่าน กรุณาเพิกเฉยต่ออีเมลนี้</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · อีเมลนี้ส่งอัตโนมัติ กรุณาอย่าตอบกลับ</p></td></tr></table></td></tr></table></body></html>`,
     );
 
