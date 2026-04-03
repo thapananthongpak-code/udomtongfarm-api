@@ -11,6 +11,7 @@ import { createClient } from '@libsql/client';
 import nodemailer from 'nodemailer';
 import sgMail from '@sendgrid/mail';
 import { createHash, createHmac } from 'crypto';
+import bcrypt from 'bcryptjs';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT         = process.env.PORT || 3000;
@@ -196,9 +197,20 @@ function sanitizeStr(s: unknown, maxLen = 500): string {
   return s.trim().slice(0, maxLen);
 }
 
-// Password hash (sha256+salt). Better than plaintext; migrate to bcrypt for production.
-function hashPassword(plain: string): string {
+// Legacy SHA256 hash (kept for migrating existing accounts)
+function legacyHash(plain: string): string {
   return createHash('sha256').update(plain + 'uf_salt_2025').digest('hex');
+}
+// New bcrypt hash
+async function hashPassword(plain: string): Promise<string> {
+  return bcrypt.hash(plain, 12);
+}
+// Verify password — supports bcrypt (new) and SHA256 (legacy, auto-upgrades on match)
+async function verifyPassword(plain: string, stored: string): Promise<boolean> {
+  if (stored.startsWith('$2b$') || stored.startsWith('$2a$')) {
+    return bcrypt.compare(plain, stored);
+  }
+  return stored === legacyHash(plain) || stored === plain;
 }
 
 // ─── Admin auth helper ────────────────────────────────────────────────────────
@@ -269,7 +281,7 @@ app.get('/setup-admin', requireSecret, async (_req: Request, res: Response) => {
   try {
     const check = await db.execute({ sql: 'SELECT id FROM admins WHERE email = ?', args: [EMAIL_USER] });
     if ((check.rows as any[]).length === 0) {
-      await db.execute({ sql: `INSERT INTO admins (name, email, password) VALUES (?, ?, ?)`, args: ['Owner', EMAIL_USER, hashPassword('admin1234')] });
+      await db.execute({ sql: `INSERT INTO admins (name, email, password) VALUES (?, ?, ?)`, args: ['Owner', EMAIL_USER, await hashPassword('admin1234')] });
       return res.json({ message: 'Admin created' });
     }
     res.json({ message: 'Admin already exists' });
@@ -307,7 +319,7 @@ app.post('/api/admins', async (req: Request, res: Response) => {
   const email = sanitizeStr(req.body?.email).toLowerCase();
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email' });
   try {
-    await db.execute({ sql: 'INSERT INTO admins (name, email, password) VALUES (?, ?, ?)', args: ['Extra Admin', email, hashPassword('admin1234')] });
+    await db.execute({ sql: 'INSERT INTO admins (name, email, password) VALUES (?, ?, ?)', args: ['Extra Admin', email, await hashPassword('admin1234')] });
     res.json({ message: 'Admin added' });
   } catch { res.status(400).json({ error: 'อีเมลนี้เป็นแอดมินอยู่แล้ว' }); }
 });
@@ -326,14 +338,24 @@ app.delete('/api/admins/:email', async (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/api/species', async (_req: Request, res: Response) => {
   try {
-    const result = await db.execute('SELECT * FROM species');
+    const result = await db.execute(`
+      SELECT s.*,
+        COALESCE(p.price, s.price, 0) AS price,
+        COALESCE(p.stock, s.stock, 0) AS stock,
+        COALESCE(p.unit, s.unit, 'head') AS unit,
+        COALESCE(p.available, s.available, 1) AS available,
+        COALESCE(p.age, s.age) AS age,
+        COALESCE(p.gender, s.gender) AS gender
+      FROM species s
+      LEFT JOIN species_pricing p ON s.id = p.species_id
+    `);
     res.json(result.rows.map((row: any) => ({
       ...row,
       tags:       JSON.parse(row.tags || '[]'),
       references: JSON.parse(row.references_data || '[]'),
       price:      row.price ?? 0,
       stock:      row.stock ?? 0,
-      unit:       row.unit ?? 'ตัว/ต้น',
+      unit:       row.unit ?? 'head',
       available:  row.available === undefined ? true : row.available === 1,
     })));
   } catch { res.status(500).json({ error: 'Failed to fetch species' }); }
@@ -400,7 +422,7 @@ app.post('/api/register', authLimiter, async (req: Request, res: Response) => {
 
     await db.execute({
       sql: 'INSERT INTO users (name, nickname, phone, birth_date, email, password, pdpa_accepted, is_verified, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)',
-      args: [sanitizeStr(name), sanitizeStr(nickname), sanitizeStr(phone), sanitizeStr(birthDate), email, hashPassword(password), pdpa ? 1 : 0, avatar || null],
+      args: [sanitizeStr(name), sanitizeStr(nickname), sanitizeStr(phone), sanitizeStr(birthDate), email, await hashPassword(password), pdpa ? 1 : 0, avatar || null],
     });
 
     const otpCode   = Math.floor(100000 + Math.random() * 900000).toString();
@@ -488,13 +510,17 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
   if (!email || !password) return res.status(400).json({ error: 'กรุณากรอกอีเมลและรหัสผ่าน', field: 'both' });
   if (!isValidEmail(email)) return res.status(400).json({ error: 'รูปแบบอีเมลไม่ถูกต้อง', field: 'email' });
 
-  const hashedPw = hashPassword(password);
   try {
     const adminResult = await db.execute({ sql: 'SELECT * FROM admins WHERE email = ?', args: [email] });
     if ((adminResult.rows as any[]).length > 0) {
       const admin = adminResult.rows[0] as any;
-      if (admin.password !== hashedPw && admin.password !== password) {
+      if (!await verifyPassword(password, admin.password)) {
         return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง', field: 'password' });
+      }
+      // Auto-upgrade legacy hash
+      if (!admin.password.startsWith('$2b$') && !admin.password.startsWith('$2a$')) {
+        const upgraded = await hashPassword(password);
+        await db.execute({ sql: 'UPDATE admins SET password = ? WHERE email = ?', args: [upgraded, email] });
       }
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'admin', DATETIME('now'))`, args: [admin.email, admin.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
       const adminToken = makeJwt({ email: admin.email, role: 'admin' });
@@ -504,8 +530,13 @@ app.post('/api/login', authLimiter, async (req: Request, res: Response) => {
     const userResult = await db.execute({ sql: 'SELECT * FROM users WHERE email = ?', args: [email] });
     if ((userResult.rows as any[]).length > 0) {
       const user = userResult.rows[0] as any;
-      if (user.password !== hashedPw && user.password !== password) {
+      if (!await verifyPassword(password, user.password)) {
         return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง', field: 'password' });
+      }
+      // Auto-upgrade legacy hash
+      if (!user.password.startsWith('$2b$') && !user.password.startsWith('$2a$')) {
+        const upgraded = await hashPassword(password);
+        await db.execute({ sql: 'UPDATE users SET password = ? WHERE email = ?', args: [upgraded, email] });
       }
       if (user.is_verified === 0) return res.status(403).json({ error: 'อีเมลนี้ยังไม่ได้รับการยืนยัน กรุณาตรวจสอบกล่องจดหมาย', field: 'email' });
       try { await db.execute({ sql: `INSERT INTO login_sessions (user_email, user_name, role, login_at) VALUES (?, ?, 'user', DATETIME('now'))`, args: [user.email, user.name || ''] }); } catch (e) { console.warn('login_sessions insert skipped:', e); }
@@ -631,7 +662,7 @@ app.post('/api/reset-password', authLimiter, async (req: Request, res: Response)
     });
     if ((result.rows as any[]).length === 0) return res.status(400).json({ error: 'OTP ไม่ถูกต้อง' });
 
-    const hashedPw   = hashPassword(newPassword);
+    const hashedPw   = await hashPassword(newPassword);
     const adminCheck = await db.execute({ sql: 'SELECT email FROM admins WHERE email = ?', args: [email] });
 
     if ((adminCheck.rows as any[]).length > 0) {
@@ -786,9 +817,18 @@ app.put('/api/settings', async (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/api/products', async (_req: Request, res: Response) => {
   try {
-    const result = await db.execute(
-      'SELECT id, type, name_th, name_en, image, price, stock, unit, available FROM species ORDER BY name_th'
-    );
+    const result = await db.execute(`
+      SELECT s.id, s.type, s.name_th, s.name_en, s.image,
+        COALESCE(p.price, s.price, 0) AS price,
+        COALESCE(p.stock, s.stock, 0) AS stock,
+        COALESCE(p.unit, s.unit, 'head') AS unit,
+        COALESCE(p.available, s.available, 1) AS available,
+        COALESCE(p.age, s.age) AS age,
+        COALESCE(p.gender, s.gender) AS gender
+      FROM species s
+      LEFT JOIN species_pricing p ON s.id = p.species_id
+      ORDER BY s.name_th
+    `);
     res.json(result.rows);
   } catch { res.status(500).json({ error: 'Fetch failed' }); }
 });
@@ -799,8 +839,9 @@ app.put('/api/products/:id', async (req: Request, res: Response) => {
   const { price, stock, unit, available, age, gender } = req.body;
   try {
     await db.execute({
-      sql: 'UPDATE species SET price = ?, stock = ?, unit = ?, available = ?, age = ?, gender = ? WHERE id = ?',
-      args: [Number(price) || 0, Number(stock) || 0, unit ?? 'ตัว/ต้น', available ? 1 : 0, age ?? null, gender ?? null, id],
+      sql: `INSERT OR REPLACE INTO species_pricing (species_id, price, stock, unit, available, age, gender, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME('now'))`,
+      args: [id, Number(price) || 0, Number(stock) || 0, unit ?? 'head', available ? 1 : 0, age ?? null, gender ?? null],
     });
     res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
   } catch { res.status(500).json({ error: 'Update failed' }); }
@@ -815,8 +856,9 @@ app.put('/api/products', async (req: Request, res: Response) => {
     for (const u of updates) {
       if (!u.id) continue;
       await db.execute({
-        sql: 'UPDATE species SET price = COALESCE(?, price), stock = COALESCE(?, stock), unit = COALESCE(?, unit), available = COALESCE(?, available), age = COALESCE(?, age), gender = COALESCE(?, gender) WHERE id = ?',
-        args: [u.price !== undefined ? Number(u.price) : null, u.stock !== undefined ? Number(u.stock) : null, u.unit ?? null, u.available !== undefined ? (u.available ? 1 : 0) : null, u.age ?? null, u.gender ?? null, u.id],
+        sql: `INSERT OR REPLACE INTO species_pricing (species_id, price, stock, unit, available, age, gender, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME('now'))`,
+        args: [u.id, u.price !== undefined ? Number(u.price) : 0, u.stock !== undefined ? Number(u.stock) : 0, u.unit ?? 'head', u.available !== undefined ? (u.available ? 1 : 0) : 0, u.age ?? null, u.gender ?? null],
       });
     }
     res.json({ message: 'อัปเดตสินค้าสำเร็จ' });
@@ -827,8 +869,12 @@ app.put('/api/products', async (req: Request, res: Response) => {
 // ADDRESSES — user shipping addresses
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/api/addresses', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const payload = token ? verifyJwt(token) : null;
+  if (!payload) return res.status(401).json({ error: 'Unauthorized' });
   const email = req.query['email'] as string;
   if (!email) return res.status(400).json({ error: 'Missing email' });
+  if (payload.role !== 'admin' && payload.email !== email) return res.status(403).json({ error: 'Forbidden' });
   try {
     const result = await db.execute({
       sql: 'SELECT * FROM user_addresses WHERE user_email = ? ORDER BY is_default DESC, id DESC',
@@ -839,10 +885,14 @@ app.get('/api/addresses', async (req: Request, res: Response) => {
 });
 
 app.post('/api/addresses', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const payload = token ? verifyJwt(token) : null;
+  if (!payload) return res.status(401).json({ error: 'Unauthorized' });
   const { user_email, name, phone, address_line, district, province, postal_code, is_default } = req.body;
   if (!user_email || !name || !address_line || !province) {
     return res.status(400).json({ error: 'Missing required fields (name, address_line, province)' });
   }
+  if (payload.role !== 'admin' && payload.email !== user_email) return res.status(403).json({ error: 'Forbidden' });
   try {
     if (is_default) {
       await db.execute({ sql: 'UPDATE user_addresses SET is_default = 0 WHERE user_email = ?', args: [user_email] });
@@ -856,11 +906,15 @@ app.post('/api/addresses', async (req: Request, res: Response) => {
 });
 
 app.put('/api/addresses/:id', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const payload = token ? verifyJwt(token) : null;
+  if (!payload) return res.status(401).json({ error: 'Unauthorized' });
   const id = req.params['id'] as string;
   const { user_email, name, phone, address_line, district, province, postal_code, is_default } = req.body;
   if (!user_email || !name || !address_line || !province) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
+  if (payload.role !== 'admin' && payload.email !== user_email) return res.status(403).json({ error: 'Forbidden' });
   try {
     if (is_default) {
       await db.execute({ sql: 'UPDATE user_addresses SET is_default = 0 WHERE user_email = ?', args: [user_email] });
@@ -874,9 +928,13 @@ app.put('/api/addresses/:id', async (req: Request, res: Response) => {
 });
 
 app.delete('/api/addresses/:id', async (req: Request, res: Response) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const payload = token ? verifyJwt(token) : null;
+  if (!payload) return res.status(401).json({ error: 'Unauthorized' });
   const id = req.params['id'] as string;
   const user_email = req.body?.user_email || req.query['email'];
   if (!user_email) return res.status(400).json({ error: 'Missing user_email' });
+  if (payload.role !== 'admin' && payload.email !== user_email) return res.status(403).json({ error: 'Forbidden' });
   try {
     await db.execute({ sql: 'DELETE FROM user_addresses WHERE id = ? AND user_email = ?', args: [id, user_email] });
     res.json({ message: 'ลบที่อยู่สำเร็จ' });
@@ -913,6 +971,15 @@ app.post('/api/orders', async (req: Request, res: Response) => {
         await db.execute({ sql: 'UPDATE species SET stock = MAX(0, stock - ?) WHERE id = ?', args: [Number(item.quantity) || 1, item.species_id] });
       } catch {}
     }
+    // Send order confirmation email (fire-and-forget)
+    const addr = shipping_address || {};
+    const itemRows = (items as any[]).map((it: any) =>
+      `<tr><td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">${it.species_name_en || it.species_name}</td><td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:center">${it.quantity}</td><td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right">฿${Number(it.subtotal||0).toLocaleString()}</td></tr>`
+    ).join('');
+    sendEmail(user_email, 'Order Confirmed — Udomtong Farm',
+      `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#fff;font-size:1.2rem;font-weight:700">🌿 Udomtong Farm — Order Confirmed</h1></td></tr><tr><td style="padding:28px 32px"><p style="margin:0 0 16px;color:#374151">Thank you for your order! We have received your request and will process it shortly.</p><div style="background:#f0fdf4;border:1px solid #6ee7b7;border-radius:8px;padding:14px 18px;margin-bottom:20px"><strong style="color:#065f46">Order ID:</strong> <code style="color:#1b4332;font-size:1rem">${orderId}</code></div><table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:20px"><tr style="background:#f9fafb"><th style="padding:10px 12px;text-align:left;font-size:0.85rem;color:#6b7280">Item</th><th style="padding:10px 12px;text-align:center;font-size:0.85rem;color:#6b7280">Qty</th><th style="padding:10px 12px;text-align:right;font-size:0.85rem;color:#6b7280">Subtotal</th></tr>${itemRows}<tr style="background:#f0fdf4"><td colspan="2" style="padding:10px 12px;font-weight:700;color:#065f46">Total</td><td style="padding:10px 12px;text-align:right;font-weight:700;color:#065f46">฿${Number(total_amount||0).toLocaleString()}</td></tr></table><p style="margin:0 0 6px;color:#374151;font-size:0.9rem"><strong>Payment:</strong> ${payment_method || 'promptpay'}</p><p style="margin:0;color:#374151;font-size:0.9rem"><strong>Ship to:</strong> ${addr.name||''} · ${addr.address_line||''} ${addr.district||''} ${addr.province||''} ${addr.postal_code||''}</p></td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · Automated email, please do not reply.</p></td></tr></table></td></tr></table></body></html>`
+    ).catch(() => {});
+
     res.json({ message: 'สั่งซื้อสำเร็จ!', orderId });
   } catch (e) {
     console.error('Create order error:', e);
@@ -988,6 +1055,18 @@ app.put('/api/admin/orders/:id/status', async (req: Request, res: Response) => {
       sql: `UPDATE orders SET status = ?, shipping_company = COALESCE(?, shipping_company), tracking_number = COALESCE(?, tracking_number), estimated_delivery = COALESCE(?, estimated_delivery), updated_at = DATETIME('now') WHERE id = ?`,
       args: [status, shipping_company || null, tracking_number || null, estimated_delivery || null, id],
     });
+    // Send status notification email (fire-and-forget)
+    const orderRow = await db.execute({ sql: 'SELECT user_email FROM orders WHERE id = ?', args: [id] });
+    if ((orderRow.rows as any[]).length > 0) {
+      const userEmail = (orderRow.rows[0] as any).user_email;
+      const statusLabels: Record<string, string> = { pending:'Pending', confirmed:'Confirmed', processing:'Processing', shipped:'Shipped', delivered:'Delivered', cancelled:'Cancelled' };
+      const statusColors: Record<string, string> = { pending:'#f59e0b', confirmed:'#3b82f6', processing:'#8b5cf6', shipped:'#06b6d4', delivered:'#10b981', cancelled:'#ef4444' };
+      const trackingHtml = tracking_number ? `<p style="margin:8px 0 0;color:#374151;font-size:0.9rem"><strong>Tracking:</strong> ${tracking_number}${shipping_company ? ` (${shipping_company})` : ''}</p>` : '';
+      const deliveryHtml = estimated_delivery ? `<p style="margin:4px 0 0;color:#374151;font-size:0.9rem"><strong>Est. Delivery:</strong> ${estimated_delivery}</p>` : '';
+      sendEmail(userEmail, `Order ${statusLabels[status]||status} — Udomtong Farm`,
+        `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:32px 0"><tr><td align="center"><table width="480" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0"><tr><td style="background:#1b4332;padding:24px 32px"><h1 style="margin:0;color:#fff;font-size:1.2rem;font-weight:700">🌿 Udomtong Farm</h1></td></tr><tr><td style="padding:28px 32px"><p style="margin:0 0 16px;color:#374151">Your order status has been updated.</p><div style="border-radius:8px;padding:14px 18px;margin-bottom:16px;background:${statusColors[status]||'#6b7280'}18;border:1px solid ${statusColors[status]||'#6b7280'}44"><strong style="color:${statusColors[status]||'#374151'};font-size:1.1rem">${statusLabels[status]||status}</strong></div><p style="margin:0;color:#374151;font-size:0.9rem"><strong>Order ID:</strong> <code>${id}</code></p>${trackingHtml}${deliveryHtml}</td></tr><tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb"><p style="margin:0;color:#9ca3af;font-size:0.75rem">© ${new Date().getFullYear()} Udomtong Farm · Automated email, please do not reply.</p></td></tr></table></td></tr></table></body></html>`
+      ).catch(() => {});
+    }
     res.json({ message: 'อัปเดตสถานะสำเร็จ' });
   } catch { res.status(500).json({ error: 'Update failed' }); }
 });
@@ -1236,6 +1315,16 @@ async function initDB() {
       postal_code TEXT,
       is_default INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS species_pricing (
+      species_id TEXT PRIMARY KEY,
+      price REAL DEFAULT 0,
+      stock INTEGER DEFAULT 0,
+      unit TEXT DEFAULT 'head',
+      available INTEGER DEFAULT 1,
+      age TEXT,
+      gender TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     await db.execute(`CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
